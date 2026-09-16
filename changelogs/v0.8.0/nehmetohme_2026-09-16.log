@@ -34,3 +34,25 @@ Modified files:
 - `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
 
 Test result: `5857 passed, 316 skipped, 6 deselected` (`uv run --frozen pytest -q -m "not scenario"`); focused Lakebase provision suite: `16 passed`.
+
+## Fix Astra Chat Completions ontology generation
+
+Context: Astra rejected ontology-generation requests before inference because its Chat Completions transport cannot combine function tools with a supported reasoning effort. The generic HTTP 400 fallback then retried without schema context and surfaced a misleading invalid-Turtle error.
+
+1. `src/agents/engine_base.py` — Use low reasoning effort for Astra direct requests, omit temperature, and expose parameter-specific compatibility checks.
+2. `src/agents/agent_owl_generator/engine.py` — Route Astra through direct-context mode with bounded embedded metadata and only disable tools for explicit tool-parameter rejection errors.
+3. `tests/units/agents/test_agent_engine_base.py` — Cover Astra's supported direct payload and the retry path when reasoning effort is rejected.
+4. `tests/units/agents/test_agent_owl_generator_truncation.py` — Cover Astra metadata grounding without Chat Completions tools and prevent unrelated HTTP 400 errors from triggering direct fallback.
+5. `tests/eval/datasets/agent_owl_generator/regression.jsonl` — Add three Astra transport and error-routing regression cases.
+6. `.planning/agents/agent_owl_generator/SPEC.md` — Document the transport constraint, direct-context mitigation, tool surface, and success criteria.
+
+Modified files:
+- `src/agents/engine_base.py`
+- `src/agents/agent_owl_generator/engine.py`
+- `tests/units/agents/test_agent_engine_base.py`
+- `tests/units/agents/test_agent_owl_generator_truncation.py`
+- `tests/eval/datasets/agent_owl_generator/regression.jsonl`
+- `.planning/agents/agent_owl_generator/SPEC.md`
+- `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
+
+Test result: `5860 passed, 316 skipped, 6 deselected` (`uv run --frozen pytest -q -m "not scenario"`); focused agent suite: `311 passed`; live Astra transport check accepted `reasoning_effort=low` without Chat Completions tools.

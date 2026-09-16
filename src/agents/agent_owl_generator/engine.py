@@ -31,6 +31,8 @@ from agents.engine_base import (
     dispatch_tool,
     extract_message_content,
     accumulate_usage,
+    is_unsupported_parameter_error,
+    supports_chat_completion_tools,
 )
 from agents.tracing import trace_agent
 
@@ -68,6 +70,7 @@ _MAX_CONSOLIDATE_ROUNDS = 2
 
 # Matches an owl:Class declaration: a subject typed via `a` or `rdf:type`.
 _OWL_CLASS_DECL_RE = re.compile(r"(?:\ba|\brdf:type)\s+owl:Class\b")
+_DIRECT_CONTEXT_MARKER = "# EMBEDDED SCHEMA CONTEXT"
 
 
 def _generation_request_limits(endpoint_name: str) -> tuple[int, int]:
@@ -81,6 +84,19 @@ def _generation_request_limits(endpoint_name: str) -> tuple[int, int]:
 def _count_owl_classes(turtle: str) -> int:
     """Count owl:Class declarations in a Turtle string (declaration-only)."""
     return len(_OWL_CLASS_DECL_RE.findall(turtle or ""))
+
+
+def _build_direct_context_prompt(user_prompt: str, ctx: ToolContext) -> str:
+    """Embed bounded metadata when Chat Completions tools are unavailable."""
+    if _DIRECT_CONTEXT_MARKER in user_prompt:
+        return user_prompt
+    metadata_context = TOOL_HANDLERS["get_metadata"](ctx)
+    return (
+        f"{user_prompt}\n\n{_DIRECT_CONTEXT_MARKER}\n"
+        "Function tools are unavailable on this endpoint. Do not request tools. "
+        "Use the schema metadata below and output the complete ontology directly.\n"
+        f"{metadata_context}"
+    )
 
 
 # =====================================================
@@ -562,6 +578,17 @@ def run_agent(
     if GENERIC_GUIDELINES.strip():
         system_content = f"{SYSTEM_PROMPT}\n\n{GENERIC_GUIDELINES}"
 
+    tools_supported = supports_chat_completion_tools(endpoint_name)
+    if not tools_supported:
+        user_prompt = _build_direct_context_prompt(user_prompt, ctx)
+        system_content += (
+            "\n\n# DIRECT CONTEXT MODE\nFunction tools are unavailable. Use the "
+            "schema metadata embedded in the user message and emit Turtle directly."
+        )
+        logger.info(
+            "Agent using direct context mode for endpoint=%s", endpoint_name
+        )
+
     messages: List[dict] = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": user_prompt},
@@ -596,7 +623,6 @@ def run_agent(
     # ------------------------------------------------------------------
     # Agent loop
     # ------------------------------------------------------------------
-    tools_supported = True
     _owl_fix_rounds = 0        # pitfall-fix rounds consumed so far
     _consolidate_rounds = 0    # over-generation consolidation rounds consumed
     _owl_eval_rounds = 0       # Evaluator (Stage-1 PGE) retry rounds consumed
@@ -652,12 +678,20 @@ def run_agent(
                 iteration + 1,
                 exc.response.text if exc.response is not None else "N/A",
             )
-            if exc.response is not None and status in (400, 422) and tools_supported:
+            if tools_supported and is_unsupported_parameter_error(exc, "tools"):
                 logger.warning(
                     "Agent: endpoint rejected tools param (HTTP %s) — falling back to direct mode",
                     status,
                 )
                 tools_supported = False
+                messages[0]["content"] += (
+                    "\n\n# DIRECT CONTEXT MODE\nFunction tools are unavailable. Use "
+                    "the schema metadata embedded in the user message and emit "
+                    "Turtle directly."
+                )
+                messages[1]["content"] = _build_direct_context_prompt(
+                    messages[1]["content"], ctx
+                )
                 notify("Endpoint does not support tools – using direct generation…")
                 try:
                     llm_response = call_serving_endpoint(

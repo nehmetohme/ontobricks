@@ -1,9 +1,10 @@
 """Tests for agents.engine_base – shared agent infrastructure."""
 
 import json
-import pytest
-from unittest.mock import patch, MagicMock
 from dataclasses import asdict
+from unittest.mock import MagicMock, patch
+
+import requests
 
 from agents.engine_base import (
     AgentStep,
@@ -84,25 +85,57 @@ class TestCallServingEndpoint:
         assert "tools" not in payload
 
     @patch("agents.engine_base.call_llm_with_retry")
-    def test_astra_tool_call_uses_supported_chat_parameters(self, mock_retry):
+    def test_astra_direct_call_uses_supported_chat_parameters(self, mock_retry):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {}
         mock_retry.return_value = mock_resp
 
-        tools = [{"type": "function", "function": {"name": "get_data"}}]
         call_serving_endpoint(
             "https://host.databricks.com",
             "tok",
             "databricks-gpt-6-astra",
             [],
-            tools=tools,
             temperature=0.1,
         )
 
         payload = mock_retry.call_args[0][2]
-        assert payload["tools"] == tools
-        assert payload["reasoning_effort"] == "none"
+        assert payload["reasoning_effort"] == "low"
         assert "temperature" not in payload
+        assert "tools" not in payload
+
+    @patch("agents.engine_base.call_llm_with_retry")
+    def test_astra_retries_without_reasoning_when_endpoint_rejects_it(
+        self, mock_retry
+    ):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = (
+            b'{"error":{"message":"Unsupported reasoning_effort parameter"}}'
+        )
+        error = requests.exceptions.HTTPError(response=response)
+        success = MagicMock()
+        success.json.return_value = {"choices": []}
+        payloads = []
+
+        def respond(_url, _headers, payload, timeout):
+            payloads.append(payload.copy())
+            if len(payloads) == 1:
+                raise error
+            return success
+
+        mock_retry.side_effect = respond
+
+        call_serving_endpoint(
+            "https://host.databricks.com",
+            "tok",
+            "databricks-gpt-6-astra",
+            [],
+        )
+
+        assert ["reasoning_effort" in payload for payload in payloads] == [
+            True,
+            False,
+        ]
 
     @patch("agents.engine_base.call_llm_with_retry")
     def test_strips_trailing_slash(self, mock_retry):

@@ -29,8 +29,9 @@ logger = get_logger(__name__)
 _UNSUPPORTED_PARAMS: Dict[str, set] = {}
 
 # Astra's Chat Completions compatibility constraints differ from the generic
-# OpenAI-style payload: function tools require reasoning_effort="none", and
-# temperature must be omitted so the endpoint can use its supported default.
+# OpenAI-style payload: direct requests support reasoning_effort="low", while
+# function tools require the Responses API and cannot use this transport.
+# Temperature must be omitted so the endpoint can use its supported default.
 _ASTRA_CHAT_ENDPOINTS = {"databricks-gpt-6-astra"}
 
 
@@ -43,6 +44,21 @@ def _looks_unsupported(body_text: str, param: str) -> bool:
     return f"does not support the {param} parameter" in low or (
         "unsupported" in low and param in low
     )
+
+
+def supports_chat_completion_tools(endpoint_name: str) -> bool:
+    """Return whether *endpoint_name* supports tools on Chat Completions."""
+    return endpoint_name not in _ASTRA_CHAT_ENDPOINTS
+
+
+def is_unsupported_parameter_error(
+    exc: requests.exceptions.HTTPError, param: str
+) -> bool:
+    """Return whether an HTTP error specifically rejects *param*."""
+    response = exc.response
+    if response is None or response.status_code not in (400, 422):
+        return False
+    return _looks_unsupported(response.text, param)
 
 
 # =====================================================
@@ -102,8 +118,8 @@ def call_serving_endpoint(
         payload["temperature"] = temperature
     if tools:
         payload["tools"] = tools
-        if is_astra_chat:
-            payload["reasoning_effort"] = "none"
+    elif is_astra_chat and "reasoning_effort" not in banned:
+        payload["reasoning_effort"] = "low"
 
     logger.info(
         "%s: POST %s — %d messages, %d tool defs, max_tokens=%d, temperature=%s",
@@ -126,7 +142,7 @@ def call_serving_endpoint(
         body_text = response.text if response is not None else ""
         # Detect and strip parameters the model rejects, then retry once.
         dropped: List[str] = []
-        for param in ("temperature",):
+        for param in ("temperature", "reasoning_effort"):
             if param in payload and _looks_unsupported(body_text, param):
                 banned.add(param)
                 payload.pop(param, None)

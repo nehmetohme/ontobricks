@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import requests
+
 from agents.agent_owl_generator import engine as owl_engine
 
 
@@ -94,6 +96,64 @@ class TestTruncationGuard:
             mock_llm.call_args.kwargs["max_tokens"],
             mock_llm.call_args.kwargs["timeout"],
         ) == (128_000, 600)
+
+    def test_astra_embeds_metadata_and_skips_chat_completion_tools(self):
+        metadata = {
+            "tables": [
+                {
+                    "name": "orders",
+                    "full_name": "catalog.schema.orders",
+                    "columns": [
+                        {"name": "order_id", "type": "string"},
+                        {"name": "total", "type": "decimal"},
+                    ],
+                }
+            ]
+        }
+        with patch.object(owl_engine, "call_serving_endpoint") as mock_llm:
+            mock_llm.return_value = _complete()
+
+            owl_engine.run_agent(
+                host="https://test.databricks.com",
+                token="tok",
+                endpoint_name="databricks-gpt-6-astra",
+                registry={"catalog": "main", "schema": "ob", "volume": "documents"},
+                metadata=metadata,
+                guidelines=_CRM_GUIDELINE,
+                options={"generation_max_iterations": 0, "owl_eval_max_rounds": 0},
+                base_uri="http://ex.org/crm#",
+            )
+
+        request = mock_llm.call_args
+        user_content = request.args[3][1]["content"]
+        assert request.kwargs["tools"] is None
+        assert "catalog.schema.orders" in user_content
+        assert "order_id" in user_content
+
+    def test_non_tool_http_400_does_not_disable_tools(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = (
+            b'{"error":{"message":"Unsupported reasoning_effort value"}}'
+        )
+        error = requests.exceptions.HTTPError(response=response)
+
+        with patch.object(owl_engine, "call_serving_endpoint") as mock_llm:
+            mock_llm.side_effect = error
+            result = owl_engine.run_agent(
+                host="https://test.databricks.com",
+                token="tok",
+                endpoint_name="tool-capable-model",
+                registry={"catalog": "main", "schema": "ob", "volume": "documents"},
+                metadata={"tables": []},
+                guidelines=_CRM_GUIDELINE,
+                options={"generation_max_iterations": 0, "owl_eval_max_rounds": 0},
+                base_uri="http://ex.org/crm#",
+            )
+
+        assert mock_llm.call_count == 1
+        assert result.success is False
+        assert "LLM request failed" in result.error
 
     def test_truncated_then_complete_recovers(self):
         """A length-truncated answer is retried, and the complete re-emission
