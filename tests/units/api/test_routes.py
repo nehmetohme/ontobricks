@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 
 from shared.fastapi.main import app
+from shared.fastapi import health
 
 
 @pytest.fixture
@@ -16,12 +17,27 @@ def client():
 
 class TestHealthRoutes:
     def test_health_check(self, client):
-        # ``/health`` is now a comprehensive readiness probe.  Individual
-        # checks may fail (no warehouse / no Lakebase in the test env)
-        # but the route always returns 200 and a stable shape so external
-        # probes can keep parsing the top-level ``status`` and
-        # ``summary.errors`` fields.
-        response = client.get("/health")
+        # Probe implementations have focused unit coverage in
+        # ``tests/units/core/test_health.py``. Keep this route contract test
+        # isolated from live Databricks retries.
+        readiness = {
+            "status": "warning",
+            "version": "test",
+            "service": "OntoBricks",
+            "framework": "FastAPI",
+            "summary": {"total": 1, "ok": 0, "warnings": 1, "errors": 0},
+            "checks": [
+                {
+                    "name": "databricks.auth",
+                    "label": "Databricks authentication",
+                    "status": "warning",
+                    "detail": "Isolated route test",
+                    "duration_ms": 0,
+                }
+            ],
+        }
+        with patch.object(health, "run_readiness_checks", return_value=readiness):
+            response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] in ("ok", "warning", "error")
@@ -309,6 +325,58 @@ class TestAutoAssignIconsAsync:
 
             task = self._wait_for_task(client, task_id)
             assert task["status"] == "failed"
+
+
+class TestGenerateOntologyAsync:
+    @staticmethod
+    def _wait_for_task(client, task_id, *, timeout=3.0, interval=0.05):
+        import time
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = client.get(f"/tasks/{task_id}")
+            if resp.status_code == 200:
+                task = (resp.json().get("task") or {})
+                if task.get("status") in ("completed", "failed", "cancelled"):
+                    return task
+            time.sleep(interval)
+        raise AssertionError(f"Task {task_id} did not terminate within {timeout}s")
+
+    def test_zero_class_output_marks_task_failed(self, client):
+        from types import SimpleNamespace
+
+        fake_result = SimpleNamespace(
+            success=True,
+            owl_content="Ecommerce ontology specification pending source access",
+            steps=[],
+            iterations=1,
+            usage={"prompt_tokens": 10, "completion_tokens": 8},
+            iteration_summary=[],
+            error="",
+        )
+
+        with patch(
+            "api.routers.internal.ontology.require_serving_llm",
+            return_value=("https://h", "t", "databricks-gpt-6-astra"),
+        ), patch(
+            "api.routers.internal.ontology.resolve_warehouse_id",
+            return_value="warehouse-id",
+        ), patch.object(
+            __import__(
+                "api.routers.internal.ontology", fromlist=["Ontology"]
+            ).Ontology,
+            "generate_with_agent",
+            return_value=fake_result,
+        ):
+            response = client.post(
+                "/ontology/wizard/generate-async",
+                json={"metadata": {"tables": [{"name": "orders"}]}},
+            )
+
+        assert response.status_code == 200
+        task = self._wait_for_task(client, response.json()["task_id"])
+        assert task["status"] == "failed"
+        assert "no classes" in (task.get("error") or "").lower()
 
 
 class TestMappingRoutes:

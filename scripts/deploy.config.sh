@@ -36,7 +36,7 @@
 # Lowercase alphanumeric + hyphens only (becomes part of the app name
 # and the DAB target: ``dev-lakebase-<id>``).
 # Env-overridable: ``DEFAULT_INSTANCE_ID=080 make deploy``.
-DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-08x}"
+DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-kasal}"
 
 # Optional: force a DAB target instead of the auto ``ontobricks-<id>``.
 # Use only to keep managing a pre-INSTANCE_ID deploy whose local state
@@ -49,28 +49,28 @@ DEFAULT_INSTANCE_ID="${DEFAULT_INSTANCE_ID:-08x}"
 # Databricks CLI profile (`databricks auth profiles`). Leave empty to use
 # the CLI default profile. Exported as DATABRICKS_CONFIG_PROFILE for all
 # `databricks` invocations when this file is sourced (make deploy, bootstrap, …).
-DEFAULT_DATABRICKS_PROFILE="${DEFAULT_DATABRICKS_PROFILE-DEFAULT}"
+DEFAULT_DATABRICKS_PROFILE="${DEFAULT_DATABRICKS_PROFILE-kasal}"
 
 # SQL Warehouse
-DEFAULT_WAREHOUSE_ID="d2096aa075ad44a3"
+DEFAULT_WAREHOUSE_ID="d837825f69a03500"
 
 # Unity Catalog
-DEFAULT_REGISTRY_CATALOG="benoit_cayla"
+DEFAULT_REGISTRY_CATALOG="kasal"
 # UC schema for the Volume registry
-DEFAULT_REGISTRY_SCHEMA="ontobricks_demo_08_repository"
-DEFAULT_REGISTRY_VOLUME="registry"
+DEFAULT_REGISTRY_SCHEMA="agents"
+DEFAULT_REGISTRY_VOLUME="ontobricks_kasal"
 
 # Lakebase Autoscaling project + branch
-DEFAULT_LAKEBASE_PROJECT="ontobricks-demo-08-registry"
+DEFAULT_LAKEBASE_PROJECT="ontobricks-kasal"
 DEFAULT_LAKEBASE_BRANCH="production"
 # Postgres database (datname) on the shared Lakebase instance — the value of
 # status.postgres_database from list-databases (underscores OK). Do NOT copy the
 # hyphenated database_id from the resource path name; those differ when the
 # datname contains underscores (API uses hyphens only in database_id / RFC-1123).
 # Each app gets its own SCHEMA inside this database.
-DEFAULT_LAKEBASE_DATABASE="ontobricks_demo_08_registry_db"
+DEFAULT_LAKEBASE_DATABASE="databricks_postgres"
 # Postgres schema inside the Lakebase database, Each instance should have its own schema for isolation.
-DEFAULT_LAKEBASE_SCHEMA="ontobricks_demo_08_registry_sc"
+DEFAULT_LAKEBASE_SCHEMA="ontobricks_kasal"
 # Example — reuse existing schema: DEFAULT_LAKEBASE_SCHEMA="ontobricks_demo"
 
 # ── 0c. Derived defaults (auto-computed — do NOT edit) ────────────────

@@ -1896,6 +1896,15 @@ async def generate_ontology_async(
                 agent_result.owl_content
             )
 
+            if stats.get("classes", 0) <= 0:
+                error = (
+                    "Ontology generation produced no classes; the model output was "
+                    "not valid Turtle."
+                )
+                logger.error("Wizard async: %s", error)
+                tm.fail_task(task.id, error)
+                return
+
             tm.advance_step(task.id, "Finalizing…")
 
             iteration_summary = agent_result.iteration_summary or []

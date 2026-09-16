@@ -28,6 +28,11 @@ logger = get_logger(__name__)
 # offending field proactively instead of re-discovering the 400 every time.
 _UNSUPPORTED_PARAMS: Dict[str, set] = {}
 
+# Astra's Chat Completions compatibility constraints differ from the generic
+# OpenAI-style payload: function tools require reasoning_effort="none", and
+# temperature must be omitted so the endpoint can use its supported default.
+_ASTRA_CHAT_ENDPOINTS = {"databricks-gpt-6-astra"}
+
 
 def _unsupported_params(endpoint_name: str) -> set:
     return _UNSUPPORTED_PARAMS.setdefault(endpoint_name, set())
@@ -88,14 +93,17 @@ def call_serving_endpoint(
     }
 
     banned = _unsupported_params(endpoint_name)
+    is_astra_chat = endpoint_name in _ASTRA_CHAT_ENDPOINTS
     payload: Dict[str, Any] = {
         "messages": messages,
         "max_tokens": max_tokens,
     }
-    if "temperature" not in banned and temperature is not None:
+    if not is_astra_chat and "temperature" not in banned and temperature is not None:
         payload["temperature"] = temperature
     if tools:
         payload["tools"] = tools
+        if is_astra_chat:
+            payload["reasoning_effort"] = "none"
 
     logger.info(
         "%s: POST %s — %d messages, %d tool defs, max_tokens=%d, temperature=%s",

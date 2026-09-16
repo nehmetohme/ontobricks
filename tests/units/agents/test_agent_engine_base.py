@@ -84,6 +84,27 @@ class TestCallServingEndpoint:
         assert "tools" not in payload
 
     @patch("agents.engine_base.call_llm_with_retry")
+    def test_astra_tool_call_uses_supported_chat_parameters(self, mock_retry):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {}
+        mock_retry.return_value = mock_resp
+
+        tools = [{"type": "function", "function": {"name": "get_data"}}]
+        call_serving_endpoint(
+            "https://host.databricks.com",
+            "tok",
+            "databricks-gpt-6-astra",
+            [],
+            tools=tools,
+            temperature=0.1,
+        )
+
+        payload = mock_retry.call_args[0][2]
+        assert payload["tools"] == tools
+        assert payload["reasoning_effort"] == "none"
+        assert "temperature" not in payload
+
+    @patch("agents.engine_base.call_llm_with_retry")
     def test_strips_trailing_slash(self, mock_retry):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {}

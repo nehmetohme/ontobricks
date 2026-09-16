@@ -37,21 +37,19 @@ from agents.tracing import trace_agent
 logger = get_logger(__name__)
 
 MAX_ITERATIONS = 10
-LLM_TIMEOUT = 180
+
+_DEFAULT_LLM_TIMEOUT = 180
+_DEFAULT_GEN_MAX_TOKENS = 8192
+# Astra's completion ceiling was verified against the live Databricks endpoint.
+# Keep conservative fallbacks because domains may select endpoints with lower limits.
+_ENDPOINT_REQUEST_LIMITS = {
+    "databricks-gpt-6-astra": (128_000, 600),
+}
 
 # Bounded PGE retry cap for the Evaluator stage (§3.5): how many times the
 # deterministic Stage-1 ontology checks may feed retry_hints back into
 # generation before owl delivery proceeds regardless.
 MAX_OWL_EVAL_ROUNDS = 2
-
-# Output-token budget per LLM call. Databricks-hosted models cap output at
-# ~8192 tokens (see agent_auto_icon_assign._ABSOLUTE_MAX_TOKENS); the full
-# ontology Turtle is emitted in one message, so budgeting below the cap risks
-# a length-truncated body that fails to parse downstream (→ empty ontology).
-# Exhaustive per-class datatype-property coverage (see # ATTRIBUTE COVERAGE)
-# makes Turtle large; 8192 is the platform ceiling — the truncation guard
-# below retries with a conciseness hint when finish_reason == "length".
-_GEN_MAX_TOKENS = 8192
 
 _TRACE_NAME = "owl_generator"
 
@@ -70,6 +68,14 @@ _MAX_CONSOLIDATE_ROUNDS = 2
 
 # Matches an owl:Class declaration: a subject typed via `a` or `rdf:type`.
 _OWL_CLASS_DECL_RE = re.compile(r"(?:\ba|\brdf:type)\s+owl:Class\b")
+
+
+def _generation_request_limits(endpoint_name: str) -> tuple[int, int]:
+    """Return the completion-token and timeout limits for an LLM endpoint."""
+    return _ENDPOINT_REQUEST_LIMITS.get(
+        endpoint_name,
+        (_DEFAULT_GEN_MAX_TOKENS, _DEFAULT_LLM_TIMEOUT),
+    )
 
 
 def _count_owl_classes(turtle: str) -> int:
@@ -569,6 +575,7 @@ def run_agent(
     logger.debug("Agent user prompt:\n%s", user_prompt)
 
     total_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
+    generation_max_tokens, llm_timeout = _generation_request_limits(endpoint_name)
 
     def notify(msg: str):
         if on_step:
@@ -576,11 +583,14 @@ def run_agent(
 
     notify("Starting agent…")
     logger.info(
-        "Agent entering main loop — endpoint=%s, tables=%d, docs=%s, max_iterations=%d",
+        "Agent entering main loop — endpoint=%s, tables=%d, docs=%s, "
+        "max_iterations=%d, max_tokens=%d, timeout=%ds",
         endpoint_name,
         len(ctx.metadata.get("tables", [])),
         selected_docs,
         MAX_ITERATIONS,
+        generation_max_tokens,
+        llm_timeout,
     )
 
     # ------------------------------------------------------------------
@@ -624,9 +634,9 @@ def run_agent(
                 endpoint_name,
                 messages,
                 tools=send_tools,
-                max_tokens=_GEN_MAX_TOKENS,
+                max_tokens=generation_max_tokens,
                 temperature=0.1,
-                timeout=LLM_TIMEOUT,
+                timeout=llm_timeout,
                 trace_name=_TRACE_NAME,
             )
         except requests.exceptions.HTTPError as exc:
@@ -656,9 +666,9 @@ def run_agent(
                         endpoint_name,
                         messages,
                         tools=None,
-                        max_tokens=_GEN_MAX_TOKENS,
+                        max_tokens=generation_max_tokens,
                         temperature=0.1,
-                        timeout=LLM_TIMEOUT,
+                        timeout=llm_timeout,
                         trace_name=_TRACE_NAME,
                     )
                 except Exception as inner:
@@ -672,9 +682,9 @@ def run_agent(
                 )
                 return result
         except requests.exceptions.ReadTimeout:
-            result.error = f"LLM request timed out after {LLM_TIMEOUT}s"
+            result.error = f"LLM request timed out after {llm_timeout}s"
             logger.error(
-                "Agent: timeout at iteration %d (limit=%ds)", iteration + 1, LLM_TIMEOUT
+                "Agent: timeout at iteration %d (limit=%ds)", iteration + 1, llm_timeout
             )
             return result
         except requests.exceptions.RequestException as exc:
@@ -862,6 +872,37 @@ def run_agent(
                 )
                 logger.error(
                     "Agent: truncated final answer at iteration %d with no budget "
+                    "to recover",
+                    iteration + 1,
+                )
+                return result
+
+            # A prose refusal or placeholder can carry finish_reason="stop"
+            # even though it is not ontology output. Never report that as a
+            # successful zero-class ontology: retry with a strict format
+            # reminder while iteration budget remains, then fail explicitly.
+            if not starts_with_prefix:
+                if iteration < MAX_ITERATIONS - 1:
+                    notify(
+                        "The model did not return Turtle — asking it to emit the "
+                        "complete ontology…"
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous answer was not an ontology. Re-emit the "
+                            "COMPLETE ontology as valid Turtle starting with @prefix. "
+                            "Output ONLY Turtle — no prose, placeholders, or code fences."
+                        ),
+                    })
+                    continue
+                result.error = (
+                    "LLM did not return valid Turtle within the iteration budget — "
+                    "the generated ontology is incomplete."
+                )
+                logger.error(
+                    "Agent: non-Turtle final answer at iteration %d with no budget "
                     "to recover",
                     iteration + 1,
                 )

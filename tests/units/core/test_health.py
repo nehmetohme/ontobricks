@@ -9,6 +9,7 @@ end-to-end against the real (degraded) test environment.
 import importlib
 import os
 import shutil
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,33 @@ from shared.fastapi import health
 # These imports work around __init__.py re-exports that shadow module paths.
 _VFS_PKG = importlib.import_module("back.core.databricks.uc")
 _LBA_MOD = importlib.import_module("back.core.databricks.lakebase")
+
+
+@pytest.fixture
+def isolated_external_readiness_probes():
+    """Replace live dependency probes while testing readiness aggregation."""
+    external_probes = (
+        "_check_databricks_auth",
+        "_check_warehouse",
+        "_check_cloud_fetch",
+        "_check_registry_volume_read",
+        "_check_registry_volume_write",
+        "_check_registry_uc_schema_ddl",
+        "_check_lakebase",
+        "_check_lakebase_permissions",
+        "_check_graphdb_lakebase",
+        "_check_lakebase_accelerated_sync",
+    )
+    with ExitStack() as stack:
+        for probe_name in external_probes:
+            stack.enter_context(
+                patch.object(
+                    health,
+                    probe_name,
+                    return_value=("warning", "Isolated aggregator test"),
+                )
+            )
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +487,7 @@ class TestCheckLakebasePermissions:
 
 
 class TestRunReadinessChecks:
-    def test_shape(self):
+    def test_shape(self, isolated_external_readiness_probes):
         result = health.run_readiness_checks()
         assert {"status", "version", "service", "framework", "summary", "checks"} <= result.keys()
         assert result["service"] == "OntoBricks"
@@ -477,7 +505,7 @@ class TestRunReadinessChecks:
             "databricks.cloudfetch",
         } <= names
 
-    def test_overall_status_is_worst(self):
+    def test_overall_status_is_worst(self, isolated_external_readiness_probes):
         with patch.object(health, "_check_tmp", return_value=("error", "boom")):
             result = health.run_readiness_checks()
         assert result["status"] == "error"

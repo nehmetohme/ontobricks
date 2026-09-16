@@ -1,0 +1,22 @@
+## Expand Astra ontology-generation completion capacity
+
+Context: Large Ecommerce ontology generations exhausted the previous 8,192-token completion budget and repeatedly failed with `finish_reason=length`. After switching to Astra, Chat Completions rejected its generic tool/temperature parameters and a prose placeholder was incorrectly reported as a successful zero-class ontology.
+
+1. `src/agents/agent_owl_generator/engine.py` — Use Astra's validated 128,000-token completion limit and a 600-second timeout while retaining conservative defaults for other endpoints.
+2. `src/agents/engine_base.py` — Send Astra-compatible Chat Completions payloads: omit `temperature` and set `reasoning_effort=none` when function tools are present.
+3. `src/agents/agent_owl_generator/engine.py` — Reject and retry prose/placeholder responses that are not Turtle.
+4. `src/api/routers/internal/ontology.py` — Mark zero-class generation output failed instead of completing the UI task.
+5. Tests — Cover Astra payload compatibility, non-Turtle retries, and accurate async task failure reporting.
+6. `.planning/agents/agent_owl_generator/SPEC.md` — Document the endpoint-specific generation limits and truncation mitigation.
+
+Modified files:
+- `src/agents/agent_owl_generator/engine.py`
+- `src/agents/engine_base.py`
+- `src/api/routers/internal/ontology.py`
+- `tests/units/agents/test_agent_engine_base.py`
+- `tests/units/agents/test_agent_owl_generator_truncation.py`
+- `tests/units/api/test_routes.py`
+- `.planning/agents/agent_owl_generator/SPEC.md`
+- `changelogs/v0.8.0/nehmetohmedb_2026-09-16.log`
+
+Test result: `5854 passed, 316 skipped, 6 deselected` (`pytest -q -m "not scenario"`); focused Astra/task regression suite: `30 passed`.

@@ -64,10 +64,11 @@ def _source_config(env: dict | None = None) -> dict[str, str]:
 class TestInstanceIdDerivation:
     def test_default_id_yields_suffixed_lakebase_target(self):
         got = _source_config()
-        assert got["INSTANCE_ID"] == "08x"
-        assert got["APP_NAME"] == "ontobricks-08x"
-        assert got["MCP_APP_NAME"] == "mcp-ontobricks-08x"
-        assert got["DAB_TARGET"] == "dev-lakebase-08x"
+        instance_id = got["INSTANCE_ID"]
+        assert instance_id
+        assert got["APP_NAME"] == f"ontobricks-{instance_id}"
+        assert got["MCP_APP_NAME"] == f"mcp-ontobricks-{instance_id}"
+        assert got["DAB_TARGET"] == f"dev-lakebase-{instance_id}"
         # Resource keys stay static — isolation is the target, not the key.
         assert got["APP_RESOURCE_KEY"] == "ontobricks_dev_app"
         assert got["MCP_APP_RESOURCE_KEY"] == "mcp_ontobricks_app"
@@ -80,7 +81,7 @@ class TestInstanceIdDerivation:
     def test_legacy_target_override_keeps_unsuffixed_name(self):
         got = _source_config(env={"DEFAULT_DAB_TARGET": "dev-lakebase"})
         assert got["DAB_TARGET"] == "dev-lakebase"
-        assert got["APP_NAME"] == "ontobricks-08x"
+        assert got["APP_NAME"] == f"ontobricks-{got['INSTANCE_ID']}"
 
     def test_dab_backend_knob_is_gone(self):
         assert "DEFAULT_DAB_BACKEND" not in CONFIG.read_text()

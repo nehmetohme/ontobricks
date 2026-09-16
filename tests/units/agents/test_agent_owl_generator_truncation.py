@@ -75,6 +75,26 @@ def _run(responses):
 
 
 class TestTruncationGuard:
+    def test_generation_uses_astra_supported_request_limits(self):
+        with patch.object(owl_engine, "call_serving_endpoint") as mock_llm:
+            mock_llm.return_value = _complete()
+
+            owl_engine.run_agent(
+                host="https://test.databricks.com",
+                token="tok",
+                endpoint_name="databricks-gpt-6-astra",
+                registry={"catalog": "main", "schema": "ob", "volume": "documents"},
+                metadata={"tables": []},
+                guidelines=_CRM_GUIDELINE,
+                options={"generation_max_iterations": 0, "owl_eval_max_rounds": 0},
+                base_uri="http://ex.org/crm#",
+            )
+
+        assert (
+            mock_llm.call_args.kwargs["max_tokens"],
+            mock_llm.call_args.kwargs["timeout"],
+        ) == (128_000, 600)
+
     def test_truncated_then_complete_recovers(self):
         """A length-truncated answer is retried, and the complete re-emission
         is accepted as the final ontology."""
@@ -97,3 +117,18 @@ class TestTruncationGuard:
         result = _run(lambda *a, **k: _truncated())
         assert result.success is False
         assert "truncat" in (result.error or "").lower()
+
+    def test_non_turtle_answer_is_retried(self):
+        placeholder = "Ecommerce ontology specification pending source access"
+        result = _run([_complete(placeholder), _complete()])
+
+        assert result.success is True
+        assert result.owl_content == _COMPLETE_TURTLE
+        assert result.iterations == 2
+
+    def test_persistent_non_turtle_answer_fails_loudly(self):
+        placeholder = "Ecommerce ontology specification pending source access"
+        result = _run(lambda *a, **k: _complete(placeholder))
+
+        assert result.success is False
+        assert "valid turtle" in (result.error or "").lower()

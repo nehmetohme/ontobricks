@@ -1,0 +1,17 @@
+## Isolate readiness route tests from live Databricks retries
+
+Context: Deployment preflight stalled because readiness contract tests opened a real SQL connection to the synthetic test workspace and inherited the connector's long retry policy.
+
+1. `tests/units/api/test_routes.py` — Stub the readiness aggregation result in the route contract test while preserving response-shape assertions.
+2. `tests/units/core/test_health.py` — Isolate external Databricks, Unity Catalog, and Lakebase probes in aggregation tests; focused probe tests continue to cover each implementation.
+3. `tests/units/settings/test_deploy_instance_id.py` — Validate derived app and target names against the configured instance ID instead of the previous workspace-specific default.
+4. `scripts/deploy.config.sh` — Configure the `kasal` workspace profile, app instance, SQL warehouse, UC Volume, and dedicated Lakebase project/schema for deployment.
+
+Modified files:
+- `scripts/deploy.config.sh`
+- `tests/units/api/test_routes.py`
+- `tests/units/core/test_health.py`
+- `tests/units/settings/test_deploy_instance_id.py`
+- `changelogs/v0.8.0/nehmetohmedb_2026-09-15.log`
+
+Test result: `uv run --frozen pytest -q -m "not scenario"` — 5849 passed, 316 skipped, 6 deselected.
