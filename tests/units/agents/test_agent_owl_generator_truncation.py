@@ -20,7 +20,6 @@ import requests
 
 from agents.agent_owl_generator import engine as owl_engine
 
-
 # The exact guideline used by Ontology → Generate / scenario 1.
 _CRM_GUIDELINE = (
     "Generate a simple ontology for a Customer Relationship Management (CRM) "
@@ -61,7 +60,7 @@ def _complete(turtle: str = _COMPLETE_TURTLE) -> dict:
     }
 
 
-def _run(responses):
+def _run(responses, on_checkpoint=None):
     with patch.object(owl_engine, "call_serving_endpoint") as mock_llm:
         mock_llm.side_effect = responses
         return owl_engine.run_agent(
@@ -73,6 +72,7 @@ def _run(responses):
             guidelines=_CRM_GUIDELINE,
             options={"generation_max_iterations": 0, "owl_eval_max_rounds": 0},
             base_uri="http://ex.org/crm#",
+            on_checkpoint=on_checkpoint,
         )
 
 
@@ -192,3 +192,26 @@ class TestTruncationGuard:
 
         assert result.success is False
         assert "valid turtle" in (result.error or "").lower()
+
+    def test_non_turtle_refinement_recovers_valid_checkpoint(self):
+        over_cap = _COMPLETE_TURTLE + "".join(
+            f":Extra{i} a owl:Class .\n" for i in range(45)
+        )
+        result = _run([
+            _complete(over_cap),
+            _complete("I could not consolidate the ontology."),
+        ])
+
+        assert result.success is True
+        assert result.owl_content == over_cap
+        assert result.recovered_from_checkpoint is True
+
+    def test_truncated_refinement_recovers_valid_checkpoint(self):
+        over_cap = _COMPLETE_TURTLE + "".join(
+            f":Extra{i} a owl:Class .\n" for i in range(45)
+        )
+        result = _run([_complete(over_cap), _truncated()])
+
+        assert result.success is True
+        assert result.owl_content == over_cap
+        assert result.recovered_from_checkpoint is True

@@ -386,6 +386,10 @@ The OntoBricks interface has a navigation bar with status indicators:
 
 > **Tip**: The **Generate** wizard provides domain-specific quick templates (CRM, E-Commerce, IoT, Healthcare, Energy). These are defined in `src/shared/config/constants.py` and can be customised or extended.
 
+The Wizard checkpoints the newest valid Turtle response before asking the LLM
+to refine it. If a later refinement fails or the app restarts, OntoBricks can
+recover and apply that checkpoint instead of discarding the completed ontology.
+
 ## Troubleshooting
 
 ### "Connection failed" Error

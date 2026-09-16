@@ -17,24 +17,25 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import requests
+from rdflib import OWL, RDF, Graph
 
-from back.core.logging import get_logger
 from agents.agent_owl_generator.tools import (
-    ToolContext,
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
+    ToolContext,
 )
-from agents.tools.pitfalls import tool_check_owl_pitfalls
 from agents.engine_base import (
     AgentStep,
+    accumulate_usage,
     call_serving_endpoint,
     dispatch_tool,
     extract_message_content,
-    accumulate_usage,
     is_unsupported_parameter_error,
     supports_chat_completion_tools,
 )
+from agents.tools.pitfalls import tool_check_owl_pitfalls
 from agents.tracing import trace_agent
+from back.core.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -86,6 +87,18 @@ def _count_owl_classes(turtle: str) -> int:
     return len(_OWL_CLASS_DECL_RE.findall(turtle or ""))
 
 
+def _validate_owl_candidate(turtle: str) -> Optional[int]:
+    """Return the parsed ``owl:Class`` count, or ``None`` for invalid Turtle."""
+    if not turtle or not turtle.strip().startswith("@prefix"):
+        return None
+    try:
+        graph = Graph()
+        graph.parse(data=turtle, format="turtle")
+    except Exception:  # noqa: BLE001 — invalid model output is expected here
+        return None
+    return len(set(graph.subjects(RDF.type, OWL.Class)))
+
+
 def _build_direct_context_prompt(user_prompt: str, ctx: ToolContext) -> str:
     """Embed bounded metadata when Chat Completions tools are unavailable."""
     if _DIRECT_CONTEXT_MARKER in user_prompt:
@@ -115,6 +128,19 @@ class AgentResult:
     error: str = ""
     usage: Dict[str, int] = field(default_factory=dict)
     iteration_summary: List[Dict] = field(default_factory=list)
+    recovered_from_checkpoint: bool = False
+    checkpoint_class_count: int = 0
+    checkpoint_iteration: int = 0
+    checkpoint_reason: str = ""
+
+
+@dataclass(frozen=True)
+class _OntologyCheckpoint:
+    """Newest parseable ontology retained during one agent run."""
+
+    content: str
+    class_count: int
+    iteration: int
 
 
 # =====================================================
@@ -357,9 +383,9 @@ def _evaluate_ontology_stage(
     never blocks OWL delivery (mirrors the pitfall-tool check).
     """
     try:
+        from agents.pge_eval.ontology_metrics import evaluate_ontology
         from back.core.w3c.owl.OntologyParser import OntologyParser
         from back.objects.ontology.Ontology import Ontology
-        from agents.pge_eval.ontology_metrics import evaluate_ontology
 
         # The model sometimes prepends a prose sentence or wraps the Turtle in
         # a markdown fence; strip that the same way the downstream registry
@@ -473,6 +499,7 @@ def run_agent(
     selected_docs: Optional[List[str]] = None,
     warehouse_id: Optional[str] = None,
     on_step: Optional[Callable[[str], None]] = None,
+    on_checkpoint: Optional[Callable[[str, int, int], None]] = None,
 ) -> AgentResult:
     """Run the ontology-generation agent.
 
@@ -608,6 +635,34 @@ def run_agent(
         if on_step:
             on_step(msg)
 
+    latest_checkpoint: Optional[_OntologyCheckpoint] = None
+
+    def recover_checkpoint(reason: str, iteration_count: int) -> AgentResult:
+        """Return the latest valid candidate when a later refinement fails."""
+        if latest_checkpoint is None:
+            result.error = reason
+            return result
+        result.success = True
+        result.owl_content = latest_checkpoint.content
+        result.iterations = iteration_count
+        result.usage = total_usage
+        result.error = ""
+        result.recovered_from_checkpoint = True
+        result.checkpoint_class_count = latest_checkpoint.class_count
+        result.checkpoint_iteration = latest_checkpoint.iteration
+        result.checkpoint_reason = reason
+        logger.warning(
+            "Agent recovered ontology checkpoint from iteration %d (%d classes): %s",
+            latest_checkpoint.iteration,
+            latest_checkpoint.class_count,
+            reason,
+        )
+        notify(
+            "Latest valid ontology recovered after a refinement failure "
+            f"({latest_checkpoint.class_count} classes)."
+        )
+        return result
+
     notify("Starting agent…")
     logger.info(
         "Agent entering main loop — endpoint=%s, tables=%d, docs=%s, "
@@ -706,27 +761,31 @@ def run_agent(
                         trace_name=_TRACE_NAME,
                     )
                 except Exception as inner:
-                    result.error = f"LLM request failed: {inner}"
                     logger.error("Agent: fallback LLM call also failed: %s", inner)
-                    return result
+                    return recover_checkpoint(
+                        f"LLM request failed: {inner}", iteration + 1
+                    )
             else:
-                result.error = f"LLM request failed: {exc}"
                 logger.error(
                     "Agent: LLM request failed at iteration %d: %s", iteration + 1, exc
                 )
-                return result
+                return recover_checkpoint(
+                    f"LLM request failed: {exc}", iteration + 1
+                )
         except requests.exceptions.ReadTimeout:
-            result.error = f"LLM request timed out after {llm_timeout}s"
             logger.error(
                 "Agent: timeout at iteration %d (limit=%ds)", iteration + 1, llm_timeout
             )
-            return result
+            return recover_checkpoint(
+                f"LLM request timed out after {llm_timeout}s", iteration + 1
+            )
         except requests.exceptions.RequestException as exc:
-            result.error = f"LLM request failed: {exc}"
             logger.error(
                 "Agent: request exception at iteration %d: %s", iteration + 1, exc
             )
-            return result
+            return recover_checkpoint(
+                f"LLM request failed: {exc}", iteration + 1
+            )
 
         elapsed_ms = int((time.time() - t0) * 1000)
         logger.info("Iteration %d: LLM responded in %dms", iteration + 1, elapsed_ms)
@@ -882,6 +941,12 @@ def run_agent(
                     iteration + 1,
                     len(content),
                 )
+                if latest_checkpoint is not None:
+                    return recover_checkpoint(
+                        "A later ontology refinement was truncated "
+                        "(finish_reason=length).",
+                        iteration + 1,
+                    )
                 if iteration < MAX_ITERATIONS - 1:
                     notify(
                         "Ontology output was truncated — asking the agent to "
@@ -899,7 +964,7 @@ def run_agent(
                         ),
                     })
                     continue
-                result.error = (
+                error = (
                     "LLM output was truncated (finish_reason=length) and could not "
                     "be completed within the iteration budget — the generated "
                     "ontology is incomplete."
@@ -909,13 +974,22 @@ def run_agent(
                     "to recover",
                     iteration + 1,
                 )
-                return result
+                return recover_checkpoint(error, iteration + 1)
 
             # A prose refusal or placeholder can carry finish_reason="stop"
             # even though it is not ontology output. Never report that as a
             # successful zero-class ontology: retry with a strict format
             # reminder while iteration budget remains, then fail explicitly.
-            if not starts_with_prefix:
+            class_count = _validate_owl_candidate(content)
+            is_valid_candidate = class_count is not None and class_count > 0
+            if not is_valid_candidate:
+                invalid_reason = (
+                    "The model returned parseable Turtle with no owl:Class declarations."
+                    if class_count == 0
+                    else "The model did not return valid Turtle."
+                )
+                if latest_checkpoint is not None:
+                    return recover_checkpoint(invalid_reason, iteration + 1)
                 if iteration < MAX_ITERATIONS - 1:
                     notify(
                         "The model did not return Turtle — asking it to emit the "
@@ -931,7 +1005,7 @@ def run_agent(
                         ),
                     })
                     continue
-                result.error = (
+                error = (
                     "LLM did not return valid Turtle within the iteration budget — "
                     "the generated ontology is incomplete."
                 )
@@ -940,7 +1014,22 @@ def run_agent(
                     "to recover",
                     iteration + 1,
                 )
-                return result
+                return recover_checkpoint(error, iteration + 1)
+
+            latest_checkpoint = _OntologyCheckpoint(
+                content=content,
+                class_count=class_count,
+                iteration=iteration + 1,
+            )
+            if on_checkpoint:
+                try:
+                    on_checkpoint(content, class_count, iteration + 1)
+                except Exception:  # noqa: BLE001 — persistence is best-effort
+                    logger.warning(
+                        "Iteration %d: ontology checkpoint callback failed",
+                        iteration + 1,
+                        exc_info=True,
+                    )
 
             result.steps.append(
                 AgentStep(
@@ -960,7 +1049,7 @@ def run_agent(
                 and max_classes > 0
                 and _consolidate_rounds < _MAX_CONSOLIDATE_ROUNDS
             ):
-                n_classes = _count_owl_classes(content)
+                n_classes = class_count
                 if n_classes > max_classes:
                     _consolidate_rounds += 1
                     logger.warning(
@@ -1094,6 +1183,8 @@ def run_agent(
             result.owl_content = content
             result.iterations = iteration + 1
             result.usage = total_usage
+            result.checkpoint_class_count = class_count
+            result.checkpoint_iteration = iteration + 1
 
             final_score = (
                 result.iteration_summary[-1]["score"]
@@ -1113,13 +1204,13 @@ def run_agent(
             return result
 
     # Exhausted all iterations
-    result.error = (
+    error = (
         f"Agent reached maximum iterations ({MAX_ITERATIONS}) without producing output"
     )
     logger.error(
         "===== AGENT FAILED ===== %s — total prompt_tokens=%d, completion_tokens=%d",
-        result.error,
+        error,
         total_usage["prompt_tokens"],
         total_usage["completion_tokens"],
     )
-    return result
+    return recover_checkpoint(error, MAX_ITERATIONS)

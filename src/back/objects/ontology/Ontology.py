@@ -6,35 +6,40 @@ operations that persist to the session; use static methods for pure transforms.
 
 from __future__ import annotations
 
+import json
 import re
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
-from back.core.logging import get_logger
 from back.core.errors import (
     InfrastructureError,
     NotFoundError,
     OntoBricksError,
     ValidationError,
 )
-from shared.config.constants import DEFAULT_BASE_URI
 from back.core.industry import (
     fetch_and_parse_cdisc,
-    fetch_and_parse_fibo,
     fetch_and_parse_fhir,
+    fetch_and_parse_fibo,
     fetch_and_parse_iof,
 )
+from back.core.logging import get_logger
 from back.core.w3c import OntologyGenerator, OntologyParser
-from back.core.w3c.owl import OntologyConflictDetector, ConflictReport
+from back.core.w3c.owl import ConflictReport, OntologyConflictDetector
 from back.core.w3c.shacl.constants import QUALITY_CATEGORIES
+from back.objects.session import is_valid_session_id
+from shared.config.constants import DEFAULT_BASE_URI
+from shared.config.settings import get_settings
 
 if TYPE_CHECKING:
     from agents.agent_auto_icon_assign.engine import (
         AgentResult as IconAssignAgentResult,
     )
-    from agents.agent_owl_generator.engine import AgentResult
     from agents.agent_business_rules_generator.engine import (
         AgentResult as BusinessRulesAgentResult,
     )
+    from agents.agent_owl_generator.engine import AgentResult
     from back.objects.session.DomainSession import DomainSession
 
 IndustryKind = Literal["fibo", "cdisc", "iof", "fhir"]
@@ -66,8 +71,76 @@ _INDUSTRY_FETCH = {
 class Ontology:
     """Ontology operations for the current domain session or as static helpers."""
 
+    GENERATION_CHECKPOINT_KEY = "ontology_generation_checkpoint"
+    _MAX_GENERATION_CHECKPOINT_CHARS = 2_000_000
+
     def __init__(self, session: "DomainSession") -> None:
         self._domain = session
+
+    @staticmethod
+    def save_generation_checkpoint_to_session(
+        session_id: Optional[str],
+        session_ref: Any,
+        *,
+        content: str,
+        class_count: int,
+        iteration: int,
+        task_id: str,
+    ) -> bool:
+        """Persist the newest valid generator candidate in the current session."""
+        if not session_id or not is_valid_session_id(session_id):
+            logger.warning("Ontology checkpoint skipped: invalid session id")
+            return False
+        if not content or len(content) > Ontology._MAX_GENERATION_CHECKPOINT_CHARS:
+            logger.warning(
+                "Ontology checkpoint skipped: invalid content size (%d chars)",
+                len(content or ""),
+            )
+            return False
+
+        session_path = Path(get_settings().session_dir) / session_id
+        checkpoint = {
+            "content": content,
+            "class_count": int(class_count),
+            "iteration": int(iteration),
+            "task_id": task_id,
+            "saved_at": time.time(),
+        }
+        try:
+            if session_path.exists():
+                session_data = json.loads(session_path.read_text())
+            else:
+                session_data = dict(session_ref) if isinstance(session_ref, dict) else {}
+            session_data[Ontology.GENERATION_CHECKPOINT_KEY] = checkpoint
+            session_path.parent.mkdir(parents=True, exist_ok=True)
+            session_path.write_text(json.dumps(session_data, default=str))
+            if isinstance(session_ref, dict):
+                session_ref.clear()
+                session_ref.update(session_data)
+            logger.info(
+                "Saved ontology checkpoint for task %s at iteration %d (%d classes)",
+                task_id,
+                iteration,
+                class_count,
+            )
+            return True
+        except Exception:  # noqa: BLE001 — checkpointing must not fail generation
+            logger.warning("Could not persist ontology checkpoint", exc_info=True)
+            return False
+
+    @staticmethod
+    def get_generation_checkpoint(
+        session_ref: Any, *, task_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return a validated checkpoint from session memory, if available."""
+        if not isinstance(session_ref, dict):
+            return None
+        checkpoint = session_ref.get(Ontology.GENERATION_CHECKPOINT_KEY)
+        if not isinstance(checkpoint, dict) or not checkpoint.get("content"):
+            return None
+        if task_id and checkpoint.get("task_id") != task_id:
+            return None
+        return dict(checkpoint)
 
     def generate_with_agent(
         self,
@@ -81,6 +154,7 @@ class Ontology:
         selected_docs: Optional[List[str]] = None,
         warehouse_id: str = "",
         on_step: Optional[Callable[[str], None]] = None,
+        on_checkpoint: Optional[Callable[[str, int, int], None]] = None,
     ) -> "AgentResult":
         """Run ``agent_owl_generator`` for this project (blocking).
 
@@ -118,6 +192,7 @@ class Ontology:
             selected_docs=list(selected_docs or []),
             warehouse_id=warehouse_id or "",
             on_step=on_step,
+            on_checkpoint=on_checkpoint,
         )
 
     def generate_rules_with_agent(
@@ -1036,7 +1111,8 @@ class Ontology:
     def _try_import_as_shacl(self, content: str) -> Optional[Dict[str, Any]]:
         """Return a dataquality import payload if *content* is a SHACL file, else None."""
         try:
-            from rdflib import Graph, RDF, Namespace as NS
+            from rdflib import RDF, Graph
+            from rdflib import Namespace as NS
             _SH = NS("http://www.w3.org/ns/shacl#")
             g = Graph()
             g.parse(data=content, format="turtle")

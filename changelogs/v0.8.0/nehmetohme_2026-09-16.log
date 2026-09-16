@@ -56,3 +56,46 @@ Modified files:
 - `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
 
 Test result: `5860 passed, 316 skipped, 6 deselected` (`uv run --frozen pytest -q -m "not scenario"`); focused agent suite: `311 passed`; live Astra transport check accepted `reasoning_effort=low` without Chat Completions tools.
+
+## Preserve valid ontology generation checkpoints
+
+Context: A large ontology could produce valid Turtle before a later consolidation
+returned invalid or zero-class output. The Wizard discarded that usable response
+and forced the user to repeat the complete generation run.
+
+Changes:
+
+1. `src/agents/agent_owl_generator/engine.py`
+   Parse every Turtle candidate, checkpoint the newest response containing OWL classes before refinement, and recover it after invalid, truncated, timed-out, or exhausted later steps.
+2. `src/back/objects/ontology/Ontology.py`
+   Persist one size-bounded checkpoint in the validated current session and expose checkpoint metadata to the agent wrapper.
+3. `src/api/routers/internal/ontology.py`
+   Capture checkpoints from the background worker, recover failed tasks from them, and add the session-scoped Wizard checkpoint endpoint.
+4. `src/front/static/ontology/js/ontology-wizard.js`
+   Retrieve and apply a saved checkpoint after failed or interrupted task monitoring and notify the user that recovery occurred.
+5. `.planning/agents/agent_owl_generator/PLAN.md`, `.planning/agents/agent_owl_generator/SPEC.md`, `.planning/agents/agent_owl_generator/eval/dataset.jsonl`, and `tests/eval/datasets/agent_owl_generator/regression.jsonl`
+   Document the recovery contract and add invalid, non-Turtle, and timeout regression examples.
+6. `tests/units/agents/test_agent_owl_generator_class_cap.py`, `tests/units/agents/test_agent_owl_generator_truncation.py`, `tests/units/ontology/test_generation_checkpoint.py`, `tests/units/api/test_routes.py`, and `tests/units/front/test_ontology_wizard_checkpoint.py`
+   Cover parsed-class validation, callback timing, in-memory and persisted recovery, endpoint behavior, session-ID safety, and the Wizard recovery contract.
+7. `docs/user-guide.md` and `docs/get-started.md`
+   Explain automatic checkpoint recovery and document the retrieval endpoint.
+
+Modified files:
+- `src/agents/agent_owl_generator/engine.py`
+- `src/back/objects/ontology/Ontology.py`
+- `src/api/routers/internal/ontology.py`
+- `src/front/static/ontology/js/ontology-wizard.js`
+- `.planning/agents/agent_owl_generator/PLAN.md`
+- `.planning/agents/agent_owl_generator/SPEC.md`
+- `.planning/agents/agent_owl_generator/eval/dataset.jsonl`
+- `tests/eval/datasets/agent_owl_generator/regression.jsonl`
+- `tests/units/agents/test_agent_owl_generator_class_cap.py`
+- `tests/units/agents/test_agent_owl_generator_truncation.py`
+- `tests/units/ontology/test_generation_checkpoint.py`
+- `tests/units/api/test_routes.py`
+- `tests/units/front/test_ontology_wizard_checkpoint.py`
+- `docs/user-guide.md`
+- `docs/get-started.md`
+- `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
+
+Tests: `uv run --frozen pytest -q -m "not scenario"` → 5871 passed, 316 skipped, 6 deselected in 28.26s; targeted checkpoint suite → 27 passed.

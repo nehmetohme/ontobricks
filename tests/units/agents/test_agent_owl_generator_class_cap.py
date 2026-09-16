@@ -18,7 +18,6 @@ from unittest.mock import patch
 
 from agents.agent_owl_generator import engine as owl_engine
 
-
 _CRM_GUIDELINE = (
     "Generate a simple ontology for a Customer Relationship Management (CRM) "
     "domain in the energy sector: customers, contacts, interactions, invoices."
@@ -42,7 +41,7 @@ def _complete(turtle: str) -> dict:
     }
 
 
-def _run(responses, options=None):
+def _run(responses, options=None, on_checkpoint=None):
     opts = {"generation_max_iterations": 0, "owl_eval_max_rounds": 0}
     if options:
         opts.update(options)
@@ -57,6 +56,7 @@ def _run(responses, options=None):
             guidelines=_CRM_GUIDELINE,
             options=opts,
             base_uri="http://ex.org/crm#",
+            on_checkpoint=on_checkpoint,
         )
 
 
@@ -73,6 +73,17 @@ class TestCountHelper:
 
     def test_empty_is_zero(self):
         assert owl_engine._count_owl_classes("") == 0
+
+    def test_candidate_validation_rejects_prefix_led_invalid_turtle(self):
+        invalid = (
+            "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+            ":Broken a owl:Class ;\n"
+        )
+
+        assert owl_engine._validate_owl_candidate(invalid) is None
+
+    def test_candidate_validation_returns_parsed_class_count(self):
+        assert owl_engine._validate_owl_candidate(_turtle_with_classes(7)) == 7
 
 
 class TestClassCapGuard:
@@ -112,3 +123,46 @@ class TestClassCapGuard:
         assert result.success is True
         assert owl_engine._count_owl_classes(result.owl_content) == 60
         assert result.iterations == 1 + owl_engine._MAX_CONSOLIDATE_ROUNDS
+
+    def test_zero_class_consolidation_recovers_valid_checkpoint(self):
+        big = _turtle_with_classes(60)
+        zero_class = (
+            "@prefix : <http://ex.org/crm#> .\n"
+            "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+            ":name a owl:DatatypeProperty .\n"
+        )
+
+        result = _run([_complete(big), _complete(zero_class)])
+
+        assert result.success is True
+        assert result.owl_content == big
+        assert result.recovered_from_checkpoint is True
+        assert result.checkpoint_class_count == 60
+        assert result.checkpoint_iteration == 1
+
+    def test_consolidation_timeout_recovers_valid_checkpoint(self):
+        import requests
+
+        big = _turtle_with_classes(60)
+        result = _run([_complete(big), requests.exceptions.ReadTimeout()])
+
+        assert result.success is True
+        assert result.owl_content == big
+        assert result.recovered_from_checkpoint is True
+
+    def test_checkpoint_callback_runs_before_consolidation_request(self):
+        big = _turtle_with_classes(60)
+        small = _turtle_with_classes(8)
+        events = []
+
+        def on_checkpoint(content, class_count, iteration):
+            events.append((content, class_count, iteration))
+
+        result = _run(
+            [_complete(big), _complete(small)],
+            on_checkpoint=on_checkpoint,
+        )
+
+        assert result.success is True
+        assert events[0] == (big, 60, 1)
+        assert events[1] == (small, 8, 2)

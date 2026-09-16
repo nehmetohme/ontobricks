@@ -1,12 +1,13 @@
 """Tests for FastAPI routes."""
 
 import json
+from unittest.mock import MagicMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
 
-from shared.fastapi.main import app
 from shared.fastapi import health
+from shared.fastapi.main import app
 
 
 @pytest.fixture
@@ -328,6 +329,12 @@ class TestAutoAssignIconsAsync:
 
 
 class TestGenerateOntologyAsync:
+    _CHECKPOINT_TURTLE = (
+        "@prefix : <http://example.org/ecommerce#> .\n"
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+        ":Order a owl:Class .\n"
+    )
+
     @staticmethod
     def _wait_for_task(client, task_id, *, timeout=3.0, interval=0.05):
         import time
@@ -377,6 +384,82 @@ class TestGenerateOntologyAsync:
         task = self._wait_for_task(client, response.json()["task_id"])
         assert task["status"] == "failed"
         assert "no classes" in (task.get("error") or "").lower()
+
+    def test_worker_completes_from_persisted_checkpoint_after_agent_failure(
+        self, client
+    ):
+        from types import SimpleNamespace
+
+        fake_result = SimpleNamespace(
+            success=False,
+            owl_content="",
+            steps=[],
+            iterations=2,
+            usage={"prompt_tokens": 20, "completion_tokens": 10},
+            iteration_summary=[],
+            error="Consolidation timed out",
+            recovered_from_checkpoint=False,
+        )
+
+        def generate_with_checkpoint(*_args, **kwargs):
+            kwargs["on_checkpoint"](self._CHECKPOINT_TURTLE, 1, 1)
+            return fake_result
+
+        def persist_checkpoint(_session_id, session_ref, **checkpoint):
+            session_ref["ontology_generation_checkpoint"] = checkpoint
+            return True
+
+        with patch(
+            "api.routers.internal.ontology.require_serving_llm",
+            return_value=("https://h", "t", "databricks-gpt-6-astra"),
+        ), patch(
+            "api.routers.internal.ontology.resolve_warehouse_id",
+            return_value="warehouse-id",
+        ), patch.object(
+            __import__(
+                "api.routers.internal.ontology", fromlist=["Ontology"]
+            ).Ontology,
+            "generate_with_agent",
+            side_effect=generate_with_checkpoint,
+        ), patch.object(
+            __import__(
+                "api.routers.internal.ontology", fromlist=["Ontology"]
+            ).Ontology,
+            "save_generation_checkpoint_to_session",
+            side_effect=persist_checkpoint,
+        ):
+            response = client.post(
+                "/ontology/wizard/generate-async",
+                json={"metadata": {"tables": [{"name": "orders"}]}},
+            )
+
+        task_id = response.json()["task_id"]
+        task = self._wait_for_task(client, task_id)
+        assert task["status"] == "completed"
+        assert task["result"]["owl_content"] == self._CHECKPOINT_TURTLE.strip()
+        assert task["result"]["recovered_from_checkpoint"] is True
+        assert task["result"]["checkpoint_reason"] == "Consolidation timed out"
+
+        checkpoint = {
+            "content": self._CHECKPOINT_TURTLE,
+            "class_count": 1,
+            "iteration": 1,
+            "task_id": task_id,
+        }
+        with patch.object(
+            __import__(
+                "api.routers.internal.ontology", fromlist=["Ontology"]
+            ).Ontology,
+            "get_generation_checkpoint",
+            return_value=checkpoint,
+        ):
+            checkpoint_response = client.get(
+                f"/ontology/wizard/checkpoint?task_id={task_id}"
+            )
+        assert checkpoint_response.status_code == 200
+        assert checkpoint_response.json()["checkpoint"]["content"] == (
+            self._CHECKPOINT_TURTLE
+        )
 
 
 class TestMappingRoutes:

@@ -91,7 +91,10 @@ async function checkAndResumeTask(taskId) {
         } else if (task.status === 'failed') {
             // Task failed
             sessionStorage.removeItem(WIZARD_TASK_KEY);
-            showNotification('Previous generation failed: ' + (task.error || 'Unknown error'), 'error');
+            const recovered = await recoverWizardCheckpoint(taskId, task.error);
+            if (!recovered) {
+                showNotification('Previous generation failed: ' + (task.error || 'Unknown error'), 'error');
+            }
         } else {
             // Task cancelled or other status
             sessionStorage.removeItem(WIZARD_TASK_KEY);
@@ -271,10 +274,16 @@ async function monitorWizardTask(taskId) {
                 sessionStorage.removeItem(WIZARD_TASK_KEY);
                 wizardCurrentTaskId = null;
                 disableWizardForm(false);
-                showNotification(
-                    'Generation was interrupted (server restarted). Please try again.',
-                    'warning'
+                const recovered = await recoverWizardCheckpoint(
+                    taskId,
+                    'Generation was interrupted because the server restarted.'
                 );
+                if (!recovered) {
+                    showNotification(
+                        'Generation was interrupted (server restarted). Please try again.',
+                        'warning'
+                    );
+                }
                 break;
             }
 
@@ -299,7 +308,10 @@ async function monitorWizardTask(taskId) {
                 sessionStorage.removeItem(WIZARD_TASK_KEY);
                 wizardCurrentTaskId = null;
                 disableWizardForm(false);
-                showNotification('Generation failed: ' + (task.error || 'Unknown error'), 'error');
+                const recovered = await recoverWizardCheckpoint(taskId, task.error);
+                if (!recovered) {
+                    showNotification('Generation failed: ' + (task.error || 'Unknown error'), 'error');
+                }
                 break;
             } else if (task.status === 'cancelled') {
                 sessionStorage.removeItem(WIZARD_TASK_KEY);
@@ -321,6 +333,38 @@ async function monitorWizardTask(taskId) {
     // Refresh task tracker
     if (typeof refreshTasks === 'function') {
         refreshTasks();
+    }
+}
+
+/**
+ * Recover the newest server-side Turtle checkpoint for this generation task.
+ * @returns {Promise<boolean>} true when a checkpoint was found and applied
+ */
+async function recoverWizardCheckpoint(taskId, reason) {
+    try {
+        const params = new URLSearchParams({ task_id: taskId });
+        const response = await fetch(`/ontology/wizard/checkpoint?${params}`, {
+            credentials: 'same-origin'
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success || !data.available || !data.checkpoint) {
+            return false;
+        }
+
+        const checkpoint = data.checkpoint;
+        await showWizardResults({
+            owl_content: checkpoint.content,
+            stats: { classes: checkpoint.class_count || 0 },
+            iteration_summary: [],
+            generation_score: null,
+            recovered_from_checkpoint: true,
+            checkpoint_iteration: checkpoint.iteration || 0,
+            checkpoint_reason: reason || 'The final generation step did not complete.'
+        });
+        return true;
+    } catch (error) {
+        console.error('[Wizard] Checkpoint recovery error:', error);
+        return false;
     }
 }
 
@@ -369,7 +413,18 @@ async function showWizardResults(result) {
         } else if (finalScore !== null) {
             successMsg = `Ontology created successfully — quality score ${finalScore}/100.`;
         }
-        showNotification(successMsg, 'success');
+        if (result.recovered_from_checkpoint) {
+            const checkpointStep = result.checkpoint_iteration
+                ? ` from agent step ${result.checkpoint_iteration}`
+                : '';
+            showNotification(
+                `Recovered the latest valid ontology${checkpointStep} and applied it. ` +
+                'The later refinement did not complete.',
+                'warning'
+            );
+        } else {
+            showNotification(successMsg, 'success');
+        }
     } else {
         showNotification('Auto-apply failed. Click Generate again to retry.', 'warning');
         clearWizardPreview();

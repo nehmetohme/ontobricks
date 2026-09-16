@@ -46,6 +46,9 @@ support function tools through this transport, so the engine embeds the bounded
 3. Given a large selected schema on Astra, complete without a Chat Completions
    tool request, ground the ontology in embedded metadata, and return at least one
    `owl:Class` declaration rather than prose or an empty result.
+4. Preserve the newest parseable Turtle candidate before every refinement and
+   return it when a later consolidation, repair, evaluator, or transport step
+   fails.
 
 ## 5. Eval dimensions
 
@@ -69,12 +72,13 @@ _To fill in M2.P4. Below is the proposed table; calibrate after baseline run._
 | **Over-generation / class explosion.** The model over-decomposes — one class per column or per attribute value (e.g. `VatAmount`, `MeterReading`, `Payment`, `Call`) — emitting ~110 classes for a ~5-entity guideline. The ontology parses fine but downstream **auto-mapping** chunks ~5 classes/chunk with cool-downs, so ~22 chunks overrun the scenario `AUTOMAP_TIMEOUT` (600s) → "Auto-Map produced no entity SQL". | Auto-assign log shows `Chunk N/22` (vs the healthy `N/4`); accepted ontology `owl:Class` count ≫ input entity count. In tests: `_count_owl_classes(content) > max_classes`. | Prompt: replaced the "30–60 classes" size limit with "prefer 8–25, one class per real-world entity, never a class per column/value, hard limit 40". Guard: a class-count check in `engine.run_agent` asks the model (bounded by `_MAX_CONSOLIDATE_ROUNDS=2`) to consolidate above `max_classes` (default 40) before accepting. Regression: `tests/eval/datasets/agent_owl_generator/regression.jsonl` + `tests/units/agents/test_agent_owl_generator_class_cap.py`. |
 | **Structural defects survive generation.** Orphan classes, dangling `rdfs:domain`/`rdfs:range`, naming violations, or duplicate classes pass the pitfall-tool loop but break registry import or downstream mapping. | `evaluate_ontology()` reports Tier-1 issues; `_evaluate_ontology_stage()` returns a retry hint. In tests: `tests/units/pge_eval/test_owl_evaluator_stage.py`. | Stage-1 PGE Evaluator after the pitfall loop: deterministic `agents.pge_eval.ontology_metrics.evaluate_ontology` feeds concrete retry hints back to the generator, bounded by `MAX_OWL_EVAL_ROUNDS=2`. Fails open on parse errors. Regression: `tests/eval/datasets/agent_owl_generator/regression.jsonl` + `tests/units/pge_eval/`. |
 | **Astra rejects Chat Completions tools before inference.** A request with function tools and `reasoning_effort=none` returns HTTP 400; the generic handler previously mislabeled it as a tools rejection, retried without schema context, and surfaced a secondary “no valid Turtle” error. | Serving response identifies `reasoning_effort`; no `finish_reason` exists because inference never started. Unit coverage verifies Astra direct mode and parameter-specific HTTP 400 classification. | Use `reasoning_effort=low` without function tools, embed the bounded metadata result in the user context, and only disable tools when the error specifically rejects the `tools` parameter. Regression: cases 004–006 plus `test_agent_engine_base.py` and `test_agent_owl_generator_truncation.py`. |
+| **A valid ontology is lost during refinement.** The initial response parses and contains classes, but a later consolidation or repair response contains prefixes without usable class declarations, returns prose, truncates, or fails at transport. The worker previously discarded the valid candidate and reported zero classes. | Candidate validation parses Turtle and counts `owl:Class` declarations before a refinement request. Regression cases 007–009 cover invalid, non-Turtle, and timed-out refinements. | Retain the newest valid candidate in the agent and current server-side session. Recover it on any later refinement failure and mark the result as checkpoint-recovered so the UI can warn while still applying it. |
 
 ## 7. Eval dataset
 
 - **Baseline:** `tests/eval/datasets/agent_owl_generator/baseline.jsonl` (3 seed examples; expansion and a live judge harness remain planned).
 - **Synthetic:** Use `databricks-synthetic-data-generation` against UC sample data.
-- **Regression:** `tests/eval/datasets/agent_owl_generator/regression.jsonl` (6 production-derived cases, including 3 Astra transport/error-routing hotfix cases).
+- **Regression:** `tests/eval/datasets/agent_owl_generator/regression.jsonl` (9 production-derived cases, including checkpoint recovery after invalid or failed refinement).
 
 ## 8. MLflow tracing
 
@@ -82,7 +86,7 @@ Existing: `@trace_agent` on the entry point in `src/agents/agent_owl_generator/`
 
 ## 9. Plan reference
 
-`.planning/agent_owl_generator-spec/PLAN.md` (to create when the team picks this up — M2.P4).
+`.planning/agents/agent_owl_generator/PLAN.md`.
 
 ## 10. Sign-off
 

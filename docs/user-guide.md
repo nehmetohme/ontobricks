@@ -1782,8 +1782,11 @@ The Wizard uses your LLM endpoint and the imported metadata to automatically des
    - **Use Table Names** — use original table names as entity names
    - **Use Column Comments** — use UC column comments in descriptions
 5. Click **Generate**.
-6. The LLM generates an OWL ontology in Turtle format. You can **preview** the result.
-7. Click **Apply** to import the generated ontology into your domain.
+6. The LLM generates an OWL ontology in Turtle format and applies it to the domain.
+7. OntoBricks stores the newest parseable Turtle candidate in the current server
+   session before requesting consolidation or quality refinements. If a later
+   refinement is invalid, truncated, times out, or is interrupted by an app
+   restart, the Wizard applies that checkpoint and displays a warning.
 
 After applying, switch to the **Model** view in the sidebar to see the visual ontology with entities, relationships, and inheritance links.
 
@@ -1955,6 +1958,9 @@ curl -X POST /domain/metadata/initialize-async \
 ## Step 4: Generate ontology
 curl -X POST /ontology/wizard/generate-async \
   -d '{"metadata": {...}, "guidelines": "...", "options": {...}}'
+
+## Retrieve the latest valid Turtle checkpoint for that task
+curl "/ontology/wizard/checkpoint?task_id=<task_id>"
 
 ## Step 4b: Apply generated ontology
 curl -X POST /ontology/import-owl \

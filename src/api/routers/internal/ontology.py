@@ -8,30 +8,26 @@ import asyncio
 import json
 import re
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Depends, Request
 
+from agents.serialization import serialize_agent_steps
 from api.routers.internal._helpers import map_route_errors
 from back.core.errors import InfrastructureError, NotFoundError, ValidationError
-from back.objects.session import SessionManager, get_session_manager
-from shared.config.settings import get_settings, Settings
-from back.objects.ontology import Ontology
-from back.objects.session import get_domain
-from back.core.task_manager import get_task_manager
 from back.core.helpers import (
     get_databricks_host_and_token,
     make_volume_file_service,
     require_serving_llm,
     resolve_warehouse_id,
 )
-from agents.serialization import serialize_agent_steps
 from back.core.industry import (
-    get_fibo_catalog,
     get_cdisc_catalog,
     get_fhir_catalog,
+    get_fibo_catalog,
     get_iof_catalog,
 )
 from back.core.industry.fhir import get_fhir_versions
 from back.core.logging import get_logger
+from back.core.task_manager import get_task_manager
 from back.core.w3c import SHACLService
 from back.core.w3c.shacl.constants import (
     AGGREGATE_ID_PREFIX,
@@ -40,7 +36,10 @@ from back.core.w3c.shacl.constants import (
     SWRL_ID_PREFIX,
     rule_check_id,
 )
+from back.objects.ontology import Ontology
+from back.objects.session import SessionManager, get_domain, get_session_manager
 from shared.config.constants import DEFAULT_BASE_URI, DEFAULT_GRAPH_NAME
+from shared.config.settings import Settings, get_settings
 
 router = APIRouter(prefix="/ontology", tags=["Ontology"])
 logger = get_logger(__name__)
@@ -932,6 +931,7 @@ async def get_swrl_text(session_mgr: SessionManager = Depends(get_session_manage
 async def export_swrl(session_mgr: SessionManager = Depends(get_session_manager)):
     """Download SWRL rules as an OntoBricks SWRL text file."""
     from fastapi.responses import Response
+
     from back.core.reasoning.SWRLTextCodec import serialize_rules
 
     domain = get_domain(session_mgr)
@@ -1643,8 +1643,8 @@ async def list_bridge_domains(
 ):
     """List registry domains available as bridge targets (excludes the current domain)."""
     with map_route_errors("Listing bridge domains failed", logger):
-        from back.objects.registry import RegistryService
         from back.core.helpers import run_blocking
+        from back.objects.registry import RegistryService
 
         domain = get_domain(session_mgr)
         svc = RegistryService.from_context(domain, settings)
@@ -1671,8 +1671,8 @@ async def list_bridge_domain_classes(
 ):
     """Load a target domain's ontology classes for bridge selection."""
     with map_route_errors("Loading bridge domain classes failed", logger):
-        from back.objects.registry import RegistryService
         from back.core.helpers import run_blocking
+        from back.objects.registry import RegistryService
 
         domain = get_domain(session_mgr)
         svc = RegistryService.from_context(domain, settings)
@@ -1819,6 +1819,23 @@ async def get_wizard_templates():
     return {"success": True, "templates": WIZARD_TEMPLATES}
 
 
+@router.get("/wizard/checkpoint")
+async def get_wizard_checkpoint(
+    task_id: str = "",
+    session_mgr: SessionManager = Depends(get_session_manager),
+):
+    """Return the newest valid ontology candidate for the current session."""
+    checkpoint = Ontology.get_generation_checkpoint(
+        session_mgr.data,
+        task_id=task_id or None,
+    )
+    return {
+        "success": True,
+        "available": checkpoint is not None,
+        "checkpoint": checkpoint,
+    }
+
+
 @router.post("/wizard/generate-async")
 async def generate_ontology_async(
     request: Request,
@@ -1837,6 +1854,10 @@ async def generate_ontology_async(
     guidelines = data.get("guidelines", "")
     options = data.get("options", {})
     documents = data.get("documents", [])
+
+    session_mgr.delete(Ontology.GENERATION_CHECKPOINT_KEY)
+    session_id = getattr(request.state, "session_id", None)
+    session_ref = session_mgr.data
 
     tables_count = len(metadata.get("tables", []))
 
@@ -1873,6 +1894,16 @@ async def generate_ontology_async(
             def on_step(msg: str):
                 tm.update_progress(task.id, task.progress, msg)
 
+            def on_checkpoint(content: str, class_count: int, iteration: int):
+                Ontology.save_generation_checkpoint_to_session(
+                    session_id,
+                    session_ref,
+                    content=content,
+                    class_count=class_count,
+                    iteration=iteration,
+                    task_id=task.id,
+                )
+
             agent_result = Ontology(domain).generate_with_agent(
                 host=host,
                 token=token,
@@ -1883,9 +1914,30 @@ async def generate_ontology_async(
                 selected_docs=documents,
                 warehouse_id=warehouse_id,
                 on_step=on_step,
+                on_checkpoint=on_checkpoint,
             )
 
-            if not agent_result.success:
+            recovered_from_checkpoint = bool(
+                getattr(agent_result, "recovered_from_checkpoint", False)
+            )
+            checkpoint_reason = getattr(agent_result, "checkpoint_reason", "")
+            checkpoint = Ontology.get_generation_checkpoint(
+                session_ref,
+                task_id=task.id,
+            )
+            if agent_result.success:
+                generated_content = agent_result.owl_content
+            elif checkpoint:
+                generated_content = checkpoint["content"]
+                recovered_from_checkpoint = True
+                checkpoint_reason = (
+                    agent_result.error or "Agent did not produce final output"
+                )
+                logger.warning(
+                    "Wizard async: recovered checkpoint for task %s after agent failure",
+                    task.id,
+                )
+            else:
                 tm.fail_task(
                     task.id, agent_result.error or "Agent did not produce output"
                 )
@@ -1893,17 +1945,31 @@ async def generate_ontology_async(
 
             tm.advance_step(task.id, "Processing results…")
             owl_content, stats = Ontology.postprocess_generated_owl(
-                agent_result.owl_content
+                generated_content
             )
 
             if stats.get("classes", 0) <= 0:
-                error = (
-                    "Ontology generation produced no classes; the model output was "
-                    "not valid Turtle."
-                )
-                logger.error("Wizard async: %s", error)
-                tm.fail_task(task.id, error)
-                return
+                if checkpoint and checkpoint["content"] != generated_content:
+                    owl_content, stats = Ontology.postprocess_generated_owl(
+                        checkpoint["content"]
+                    )
+                    recovered_from_checkpoint = stats.get("classes", 0) > 0
+                    checkpoint_reason = (
+                        checkpoint_reason
+                        or "The final agent response was not valid Turtle."
+                    )
+                if stats.get("classes", 0) > 0:
+                    logger.warning(
+                        "Wizard async: replaced invalid final output with checkpoint"
+                    )
+                else:
+                    error = (
+                        "Ontology generation produced no classes; the model output was "
+                        "not valid Turtle."
+                    )
+                    logger.error("Wizard async: %s", error)
+                    tm.fail_task(task.id, error)
+                    return
 
             tm.advance_step(task.id, "Finalizing…")
 
@@ -1927,9 +1993,26 @@ async def generate_ontology_async(
                     "iteration_summary": iteration_summary,
                     "generation_score": final_score,
                     "generation_converged": converged,
+                    "recovered_from_checkpoint": recovered_from_checkpoint,
+                    "checkpoint_class_count": (
+                        checkpoint.get("class_count", stats.get("classes", 0))
+                        if checkpoint
+                        else getattr(agent_result, "checkpoint_class_count", 0)
+                    ),
+                    "checkpoint_iteration": (
+                        checkpoint.get("iteration", 0)
+                        if checkpoint
+                        else getattr(agent_result, "checkpoint_iteration", 0)
+                    ),
+                    "checkpoint_reason": checkpoint_reason,
                 },
                 message=(
-                    f"Generated {stats.get('classes', 0)} classes, "
+                    (
+                        "Recovered the latest valid ontology checkpoint: "
+                        if recovered_from_checkpoint
+                        else "Generated "
+                    )
+                    + f"{stats.get('classes', 0)} classes, "
                     f"{stats.get('properties', 0)} properties "
                     f"({agent_result.iterations} agent iterations)"
                     + (f" — quality score {final_score}/100" if final_score is not None else "")
@@ -2187,8 +2270,9 @@ async def ontology_assistant_invoke(
     Returns a ``ResponsesAgentResponse`` with ``custom_outputs`` containing
     the mutated ontology when changes were made.
     """
-    from agents.agent_ontology_assistant import OntologyAssistantResponsesAgent
     from mlflow.types.responses import ResponsesAgentRequest as RAReq
+
+    from agents.agent_ontology_assistant import OntologyAssistantResponsesAgent
 
     data = await request.json()
 
