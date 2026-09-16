@@ -8,10 +8,10 @@ import requests
 
 from agents.engine_base import (
     AgentStep,
+    accumulate_usage,
     call_serving_endpoint,
     dispatch_tool,
     extract_message_content,
-    accumulate_usage,
 )
 
 
@@ -104,14 +104,169 @@ class TestCallServingEndpoint:
         assert "tools" not in payload
 
     @patch("agents.engine_base.call_llm_with_retry")
-    def test_astra_retries_without_reasoning_when_endpoint_rejects_it(
-        self, mock_retry
-    ):
+    def test_astra_tool_call_uses_responses_api(self, mock_retry):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "completed", "output": []}
+        mock_retry.return_value = mock_resp
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "submit_mapping",
+                    "description": "Submit a mapping.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        call_serving_endpoint(
+            "https://host.databricks.com",
+            "tok",
+            "databricks-gpt-6-astra",
+            [
+                {"role": "system", "content": "Map the entity."},
+                {"role": "user", "content": "Map Address."},
+            ],
+            tools=tools,
+        )
+
+        url, _, payload = mock_retry.call_args[0]
+        assert url == "https://host.databricks.com/serving-endpoints/responses"
+        assert payload["model"] == "databricks-gpt-6-astra"
+        assert payload["instructions"] == "Map the entity."
+        assert payload["input"] == [{"role": "user", "content": "Map Address."}]
+        assert payload["tools"][0]["name"] == "submit_mapping"
+        assert payload["reasoning"] == {"effort": "low"}
+
+    @patch("agents.engine_base.call_llm_with_retry")
+    def test_astra_function_call_is_adapted_to_chat_completion(self, mock_retry):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "submit_mapping",
+                    "arguments": '{"class_name":"Address"}',
+                },
+            ],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 10,
+                "total_tokens": 30,
+            },
+        }
+        mock_retry.return_value = mock_resp
+
+        result = call_serving_endpoint(
+            "https://host.databricks.com",
+            "tok",
+            "databricks-gpt-6-astra",
+            [{"role": "user", "content": "Map Address."}],
+            tools=[{"type": "function", "function": {"name": "submit_mapping"}}],
+        )
+
+        choice = result["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["tool_calls"] == [
+            {
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                    "name": "submit_mapping",
+                    "arguments": '{"class_name":"Address"}',
+                },
+            }
+        ]
+        assert choice["message"]["_responses_output_items"][0] == {
+            "type": "reasoning",
+            "id": "rs_123",
+            "summary": [],
+        }
+        assert result["usage"] == {
+            "prompt_tokens": 20,
+            "completion_tokens": 10,
+            "total_tokens": 30,
+        }
+
+    @patch("agents.engine_base.call_llm_with_retry")
+    def test_astra_responses_history_stays_on_responses_api_without_tools(self, mock_retry):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "completed", "output": []}
+        mock_retry.return_value = mock_resp
+
+        call_serving_endpoint(
+            "https://host.databricks.com",
+            "tok",
+            "databricks-gpt-6-astra",
+            [
+                {"role": "user", "content": "Map Address."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "_responses_output_items": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_123",
+                            "summary": [],
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_123",
+                            "name": "submit_mapping",
+                            "arguments": '{"class_name":"Address"}',
+                        },
+                    ],
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_mapping",
+                                "arguments": '{"class_name":"Address"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_123",
+                    "content": '{"success":true}',
+                },
+            ],
+        )
+
+        url, _, payload = mock_retry.call_args[0]
+        assert url == "https://host.databricks.com/serving-endpoints/responses"
+        assert "tools" not in payload
+        assert payload["input"][1] == {
+            "type": "reasoning",
+            "id": "rs_123",
+            "summary": [],
+        }
+        assert payload["input"][2] == {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "submit_mapping",
+            "arguments": '{"class_name":"Address"}',
+        }
+        assert payload["input"][3] == {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": '{"success":true}',
+        }
+
+    @patch("agents.engine_base.call_llm_with_retry")
+    def test_astra_retries_without_reasoning_when_endpoint_rejects_it(self, mock_retry):
         response = requests.Response()
         response.status_code = 400
-        response._content = (
-            b'{"error":{"message":"Unsupported reasoning_effort parameter"}}'
-        )
+        response._content = b'{"error":{"message":"Unsupported reasoning_effort parameter"}}'
         error = requests.exceptions.HTTPError(response=response)
         success = MagicMock()
         success.json.return_value = {"choices": []}
@@ -174,9 +329,7 @@ class TestDispatchTool:
         def echo_handler(ctx, **kwargs):
             return json.dumps(kwargs)
 
-        result = dispatch_tool(
-            {"echo": echo_handler}, MagicMock(), "echo", {"a": 1, "b": "two"}
-        )
+        result = dispatch_tool({"echo": echo_handler}, MagicMock(), "echo", {"a": 1, "b": "two"})
         assert json.loads(result) == {"a": 1, "b": "two"}
 
 

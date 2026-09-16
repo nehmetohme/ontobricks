@@ -22,7 +22,7 @@ one serial agentic loop over chunks of items, driven by
 |---|---|
 | `agent_name` | `agent_auto_assignment` |
 | `module_path` | `src/agents/agent_auto_assignment/` |
-| `model_endpoint` | _TBD_ |
+| `model_endpoint` | Configured per workspace; this transport regression targets `databricks-gpt-6-astra` |
 | `temperature` | `0.0` (deterministic ground truth) |
 | `mlflow_experiment` | `/Shared/ontobricks/agents/auto_assignment` |
 
@@ -103,6 +103,7 @@ on the mapping-quality dimensions above.
 | Live overlay stays empty during a long run | `trace_step_order` finds no `tool_call` before the terminal event | republish `task.result["agent_steps"]` per chunk, not only at completion |
 | Audit trail shows mapping chips but no agent report | `audit_report_parity` = 0 (no `agent_auto_map_run` row) | append the event on all three terminal paths, not just success |
 | Cancel leaves the agent running and the report missing | cancel case in `observability.jsonl` ends without a `cancelled` report | `is_cancelled` check at the top of each chunk |
+| Astra rejects mapping tools on Chat Completions | HTTP 400 mentions function tools with `reasoning_effort`; the mapping task fails before inference | Route Astra tool calls and their remaining conversation history through `/serving-endpoints/responses`, preserve reasoning output items across iterations, and adapt the result to the agent's existing Chat Completions contract |
 | _TBD_ | _TBD_ | _TBD_ |
 
 ## 7. Eval dataset

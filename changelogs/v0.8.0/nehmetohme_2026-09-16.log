@@ -99,3 +99,29 @@ Modified files:
 - `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
 
 Tests: `uv run --frozen pytest -q -m "not scenario"` → 5871 passed, 316 skipped, 6 deselected in 28.26s; targeted checkpoint suite → 27 passed.
+
+## Enable Astra function tools for auto-mapping
+
+Context: Auto-map failed before inference because `databricks-gpt-6-astra` does not accept function tools through its Chat Completions endpoint. Ontology generation remained operational because that flow embeds context directly and does not require tool calls.
+
+Changes:
+
+1. `src/agents/engine_base.py`
+   Route Astra requests with tools through the workspace Responses API, translate tool schemas and message history, preserve reasoning output across iterations, and adapt responses to the existing agent contract.
+2. `tests/units/agents/test_agent_engine_base.py`
+   Cover Astra transport selection, function-call adaptation, reasoning-state and tool-result round trips, and existing non-Astra behavior.
+3. `.planning/agents/agent_auto_assignment/SPEC.md` and `.planning/agents/agent_auto_assignment/PLAN.md`
+   Document the Astra tool-transport failure mode, compatibility contract, implementation plan, and verification criteria.
+4. `.planning/agents/agent_auto_assignment/eval/dataset.jsonl` and `tests/eval/datasets/agent_auto_assignment/regression.jsonl`
+   Add three permanent regression cases for initial function calls, multi-turn tool results, and non-Astra compatibility.
+
+Modified files:
+- `src/agents/engine_base.py`
+- `tests/units/agents/test_agent_engine_base.py`
+- `.planning/agents/agent_auto_assignment/SPEC.md`
+- `.planning/agents/agent_auto_assignment/PLAN.md`
+- `.planning/agents/agent_auto_assignment/eval/dataset.jsonl`
+- `tests/eval/datasets/agent_auto_assignment/regression.jsonl`
+- `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
+
+Tests: `uv run --frozen pytest -q -m "not scenario"` → 5874 passed, 316 skipped, 6 deselected in 28.21s; focused mapping suite → 135 passed; Ruff → all checks passed.
