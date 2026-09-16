@@ -106,6 +106,11 @@ def grant_can_use_on_project(
 ) -> Tuple[List[str], List[str]]:
     """Grant ``CAN_USE`` on the Lakebase project to each service principal.
 
+    First probes the project's branch collection. A successful read proves
+    that the caller already has usable project access, so no ACL mutation is
+    needed. This matters for deployed apps: their service principal normally
+    has ``CAN_USE`` but not the ``CAN_MANAGE`` needed to re-grant it.
+
     Tries both the Autoscaling (``database-projects``) and Provisioned
     (``database-instances``) permission securables; success on either is
     enough. Best-effort — a failure on both becomes a warning.
@@ -119,6 +124,22 @@ def grant_can_use_on_project(
     granted: List[str] = []
     warnings: List[str] = []
     for app_name, sp_id in sp_ids.items():
+        try:
+            api.do(
+                "GET",
+                f"/api/2.0/postgres/projects/{project_short}/branches",
+            )
+            granted.append(
+                f"{app_name}: CAN_USE on project (already available)"
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Lakebase project access probe for %s failed: %s",
+                app_name,
+                exc,
+            )
+
         ok = False
         for securable in ("database-projects", "database-instances"):
             try:

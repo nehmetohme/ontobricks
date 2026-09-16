@@ -20,3 +20,17 @@ Modified files:
 - `changelogs/v0.8.0/nehmetohmedb_2026-09-16.log`
 
 Test result: `5854 passed, 316 skipped, 6 deselected` (`pytest -q -m "not scenario"`); focused Astra/task regression suite: `30 passed`.
+
+## Avoid false Lakebase CAN_USE repair warnings
+
+Context: The deployed app service principal can use its Lakebase project but cannot mutate the project ACL without CAN_MANAGE. The in-app repair action therefore displayed a failed re-grant warning even though CAN_USE was already operational.
+
+1. `src/back/core/databricks/lakebase/grants.py` — Probe project branch access before attempting an ACL mutation and report existing usable access as granted.
+2. `tests/units/settings/test_lakebase_provision.py` — Cover existing access, successful ACL fallback, failed ACL fallback, and canonical project-name probing.
+
+Modified files:
+- `src/back/core/databricks/lakebase/grants.py`
+- `tests/units/settings/test_lakebase_provision.py`
+- `changelogs/v0.8.0/nehmetohme_2026-09-16.log`
+
+Test result: `5857 passed, 316 skipped, 6 deselected` (`uv run --frozen pytest -q -m "not scenario"`); focused Lakebase provision suite: `16 passed`.

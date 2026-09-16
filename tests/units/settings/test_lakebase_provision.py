@@ -12,11 +12,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from back.core.task_manager import get_task_manager
+from back.core.databricks.lakebase.grants import grant_can_use_on_project
 from back.core.graphdb.lakebase.provisioner import (
     LakebaseGraphProvisioner,
     provision_steps,
 )
+from back.core.task_manager import get_task_manager
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +200,63 @@ def _make_provisioner(api, sql_log, *, grant_uc=False, **overrides):
     return prov, task, patcher
 
 
+class _ProjectGrantApi:
+    """Fake control-plane API for focused project grant behaviour."""
+
+    def __init__(self, *, has_access=False, patch_succeeds=False):
+        self.has_access = has_access
+        self.patch_succeeds = patch_succeeds
+        self.calls = []
+
+    def do(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if method == "GET" and path.endswith("/branches"):
+            if self.has_access:
+                return {"branches": []}
+            raise PermissionError("project access denied")
+        if method == "PATCH" and self.patch_succeeds:
+            return {}
+        raise PermissionError("project grant denied")
+
+
+@pytest.mark.unit
+class TestProjectCanUseGrant:
+    def test_existing_project_access_skips_acl_mutation(self):
+        api = _ProjectGrantApi(has_access=True)
+
+        result = grant_can_use_on_project(
+            api, "test-project", {"test-app": "app-sp"}
+        )
+
+        assert (result, [call[0] for call in api.calls]) == (
+            (
+                ["test-app: CAN_USE on project (already available)"],
+                [],
+            ),
+            ["GET"],
+        )
+
+    def test_missing_project_access_falls_back_to_acl_mutation(self):
+        api = _ProjectGrantApi(patch_succeeds=True)
+
+        result = grant_can_use_on_project(
+            api, "test-project", {"test-app": "app-sp"}
+        )
+
+        assert result == (["test-app: CAN_USE on project"], [])
+
+    def test_missing_project_access_and_failed_mutation_warns(self):
+        api = _ProjectGrantApi()
+
+        granted, warnings = grant_can_use_on_project(
+            api, "test-project", {"test-app": "app-sp"}
+        )
+
+        assert not granted and warnings[0].startswith(
+            "test-app: could not re-grant CAN_USE on project"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Provisioner step sequence
 # ---------------------------------------------------------------------------
@@ -296,8 +354,12 @@ class TestProvisioner:
         assert task.status.value == "completed"
         assert task.result["instance"] == "test-db"
         assert any("normalised to lowercase" in w for w in task.result["warnings"])
-        # CAN_USE grant targeted the canonical lowercase project name.
-        assert any("database-projects/test-db" in c[0] for c in api.permission_calls)
+        # CAN_USE access probe targeted the canonical lowercase project name.
+        assert any(
+            c[0] == "GET"
+            and c[1] == "/api/2.0/postgres/projects/test-db/branches"
+            for c in api.calls
+        )
 
     def test_project_resolution_follows_next_page_token(self):
         api = _FakeApi(project_on_second_page=True)
