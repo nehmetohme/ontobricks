@@ -562,3 +562,39 @@ class TestToolGetOntologyExcludedAttributes:
         # B: unaffected
         assert "bar" in entities_by_name["B"]["attributes"]
         assert "foo" in entities_by_name["B"]["attributes"]
+
+
+@pytest.mark.unit
+class TestToolGetOntologyPendingAttributes:
+    def test_wide_entity_returns_every_pending_attribute(self):
+        uri = "http://t/WideEntity"
+        attributes = [f"attribute_{index}" for index in range(75)]
+        ctx = _ctx(
+            ontology={
+                "entities": [
+                    {"uri": uri, "name": "WideEntity", "attributes": attributes}
+                ],
+                "relationships": [],
+            },
+            entity_mappings=[
+                {
+                    "ontology_class": uri,
+                    "sql_query": "SELECT source_id AS ID, name AS Label FROM source",
+                    "id_column": "ID",
+                    "label_column": "Label",
+                    "attribute_mappings": {
+                        name: name for name in attributes[:10]
+                    },
+                    "excluded_attributes": attributes[10:12],
+                }
+            ],
+        )
+
+        result = json.loads(tool_get_ontology(ctx))
+
+        entity = result["entities"][0]
+        assert entity["attributes"] == attributes[12:]
+        assert "_note" not in entity
+        assert entity["existing_mapping"]["attribute_mappings"] == {
+            name: name for name in attributes[:10]
+        }

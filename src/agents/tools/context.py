@@ -36,6 +36,8 @@ class ToolContext:
     ontology: Optional[dict] = None
     entity_mappings: list = field(default_factory=list)
     relationships: list = field(default_factory=list)
+    submitted_entity_uris: set[str] = field(default_factory=set)
+    submitted_relationship_uris: set[str] = field(default_factory=set)
     documents: list = field(
         default_factory=list
     )  # Pre-loaded doc content: [{"name": str, "content": str}]

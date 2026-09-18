@@ -27,6 +27,24 @@ def _strip_backticks(value: str) -> str:
     return value
 
 
+def _select_output_columns(sql_query: str) -> set[str]:
+    """Return case-folded output names from a simple SELECT projection."""
+    parsed = SQLWizardService._parse_select_columns(sql_query)
+    if parsed is None or len(parsed) != 3:
+        return set()
+    return {
+        SQLWizardService._effective_name(column).casefold()
+        for column in SQLWizardService._split_columns(parsed[1])
+    }
+
+
+def _unmapped_attribute_name(item: object) -> str:
+    """Return the ontology attribute name from either supported unmapped shape."""
+    if isinstance(item, dict):
+        return str(item.get("name", ""))
+    return str(item)
+
+
 def tool_submit_entity_mapping(
     ctx: ToolContext,
     *,
@@ -104,11 +122,8 @@ def tool_submit_entity_mapping(
         ),
         -1,
     )
-    existing_excl: list = (
-        ctx.entity_mappings[existing_idx].get("excluded_attributes", [])
-        if existing_idx >= 0
-        else []
-    )
+    existing_mapping = ctx.entity_mappings[existing_idx] if existing_idx >= 0 else {}
+    existing_excl: list = existing_mapping.get("excluded_attributes", [])
 
     raw_attr_mappings = attribute_mappings or {}
     if declared_attrs:
@@ -131,14 +146,69 @@ def tool_submit_entity_mapping(
             discarded,
         )
 
+    merged_attribute_mappings = dict(existing_mapping.get("attribute_mappings") or {})
+    merged_attribute_mappings.update(filtered_mappings)
+
+    output_columns = _select_output_columns(clean_sql)
+    existing_output_columns = _select_output_columns(
+        existing_mapping.get("sql_query", "")
+    )
+    retained_output_columns = {
+        column
+        for column in (existing_mapping.get("attribute_mappings") or {}).values()
+        if column.casefold() in existing_output_columns
+    }
+    missing_columns = sorted(
+        {
+            column
+            for column in retained_output_columns
+            if column.casefold() not in output_columns
+        },
+        key=str.casefold,
+    )
+    if missing_columns:
+        logger.warning(
+            "tool_submit_entity_mapping: '%s' — rejected SQL missing %d mapped "
+            "output column(s): %s",
+            class_name,
+            len(missing_columns),
+            missing_columns,
+        )
+        return json.dumps(
+            {
+                "error": "sql_query drops mapped output columns",
+                "missing_columns": missing_columns,
+                "instruction": (
+                    "Extend the existing SQL projection and resubmit with every existing and "
+                    "newly mapped output column."
+                ),
+            }
+        )
+
+    unmapped_by_name = {
+        _unmapped_attribute_name(item): item
+        for item in existing_mapping.get("unmapped_attributes", []) or []
+        if _unmapped_attribute_name(item)
+    }
+    unmapped_by_name.update(
+        {
+            _unmapped_attribute_name(item): item
+            for item in normalised_unmapped
+            if _unmapped_attribute_name(item)
+        }
+    )
+    for mapped_attribute in merged_attribute_mappings:
+        unmapped_by_name.pop(mapped_attribute, None)
+
     mapping = {
+        **existing_mapping,
         "ontology_class": class_uri,
         "class_name": class_name,
         "sql_query": clean_sql,
         "id_column": id_column,
         "label_column": label_column,
-        "attribute_mappings": filtered_mappings,
-        "unmapped_attributes": normalised_unmapped,
+        "attribute_mappings": merged_attribute_mappings,
+        "unmapped_attributes": list(unmapped_by_name.values()),
     }
     # Preserve user-set excluded_attributes across auto-map runs.
     if existing_excl:
@@ -163,6 +233,7 @@ def tool_submit_entity_mapping(
     else:
         ctx.entity_mappings.append(mapping)
         logger.debug("tool_submit_entity_mapping: appended new mapping")
+    ctx.submitted_entity_uris.add(class_uri)
 
     mapped_attrs = len(mapping["attribute_mappings"])
     unmapped_count = len(mapping["unmapped_attributes"])
@@ -288,6 +359,7 @@ def tool_submit_relationship_mapping(
     else:
         ctx.relationships.append(mapping)
         logger.debug("tool_submit_relationship_mapping: appended new mapping")
+    ctx.submitted_relationship_uris.add(property_uri)
 
     logger.info(
         "tool_submit_relationship_mapping: '%s' recorded — source=%s, target=%s",

@@ -11,6 +11,8 @@ resolves as the same one, and the digital-twin build fails with
 mapping, regardless of what the LLM actually generated.
 """
 
+import json
+
 import pytest
 
 from agents.tools.context import ToolContext
@@ -93,3 +95,86 @@ class TestRelationshipMappingDedup:
         stored_sql = ctx.relationships[0]["sql_query"]
         assert "AS source_id" in stored_sql
         assert "AS target_id" in stored_sql
+
+
+@pytest.mark.unit
+class TestIncrementalEntityMapping:
+    URI = "http://test.org/ontology#Customer"
+
+    @pytest.fixture
+    def partial_ctx(self):
+        return ToolContext(
+            host="https://test.databricks.com",
+            token="fake-token",
+            ontology={
+                "entities": [
+                    {
+                        "uri": self.URI,
+                        "name": "Customer",
+                        "attributes": ["firstName", "lastName"],
+                    }
+                ],
+                "relationships": [],
+            },
+            entity_mappings=[
+                {
+                    "ontology_class": self.URI,
+                    "class_name": "Customer",
+                    "sql_query": (
+                        "SELECT customer_id AS ID, display_name AS Label, "
+                        "first_name FROM catalog.schema.customers"
+                    ),
+                    "id_column": "ID",
+                    "label_column": "Label",
+                    "attribute_mappings": {"firstName": "first_name"},
+                    "excluded_attributes": ["internalNote"],
+                }
+            ],
+        )
+
+    def test_extends_existing_mapping_when_projection_is_complete(self, partial_ctx):
+        result = json.loads(
+            tool_submit_entity_mapping(
+                partial_ctx,
+                class_uri=self.URI,
+                class_name="Customer",
+                sql_query=(
+                    "SELECT customer_id AS ID, display_name AS Label, first_name, "
+                    "last_name FROM catalog.schema.customers"
+                ),
+                id_column="ID",
+                label_column="Label",
+                attribute_mappings={"lastName": "last_name"},
+            )
+        )
+
+        assert result["success"] is True
+        assert partial_ctx.entity_mappings[0]["attribute_mappings"] == {
+            "firstName": "first_name",
+            "lastName": "last_name",
+        }
+        assert partial_ctx.entity_mappings[0]["excluded_attributes"] == [
+            "internalNote"
+        ]
+
+    def test_rejects_sql_that_drops_existing_mapped_column(self, partial_ctx):
+        original = dict(partial_ctx.entity_mappings[0])
+
+        result = json.loads(
+            tool_submit_entity_mapping(
+                partial_ctx,
+                class_uri=self.URI,
+                class_name="Customer",
+                sql_query=(
+                    "SELECT customer_id AS ID, display_name AS Label, last_name "
+                    "FROM catalog.schema.customers"
+                ),
+                id_column="ID",
+                label_column="Label",
+                attribute_mappings={"lastName": "last_name"},
+            )
+        )
+
+        assert result["error"] == "sql_query drops mapped output columns"
+        assert result["missing_columns"] == ["first_name"]
+        assert partial_ctx.entity_mappings[0] == original

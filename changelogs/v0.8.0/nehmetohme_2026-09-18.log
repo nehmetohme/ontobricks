@@ -1,0 +1,52 @@
+## Complete incremental attribute reassignment
+
+Context: Re-Assign Missing Attributes could finish successfully while attribute coverage stayed near 10%. The ontology tool silently exposed only the first 30 attributes per entity, existing mappings were counted as current-run results, and a retry could replace rather than extend prior attribute assignments.
+
+Changes:
+
+1. .planning/agents/agent_auto_assignment/PLAN.md
+   Documented the incremental reassignment contract, failure modes, success criteria, and implementation plan.
+2. .planning/agents/agent_auto_assignment/SPEC.md
+   Completed the relevant tool surface and added attribute visibility, merge safety, and coverage reporting requirements.
+3. .planning/agents/agent_auto_assignment/eval/dataset.jsonl
+   Added production-derived wide-entity, incremental-merge, and projection-safety regression cases.
+4. src/agents/agent_auto_assignment/engine.py
+   Tracks only submissions made by the current run, reports attribute coverage, guides SQL projection extension, and raises the output budget for wide mappings.
+5. src/agents/tools/context.py
+   Tracks entity and relationship URIs submitted during the current agent run.
+6. src/agents/tools/mapping.py
+   Merges incremental attribute assignments, preserves exclusions and unmapped details, and rejects SQL that drops valid mapped output columns.
+7. src/agents/tools/ontology.py
+   Removed the 30-attribute truncation and returns every pending attribute with existing mapping context.
+8. src/back/objects/mapping/Mapping.py
+   Preserves existing attribute mappings during session merges and publishes requested, mapped, and remaining attribute statistics.
+9. src/front/static/mapping/js/mapping-autoassign.js
+   Sends only missing attributes during reassignment and reports the true missing-attribute count.
+10. tests/eval/datasets/agent_auto_assignment/regression.jsonl
+    Mirrored the three production regression cases in the committed evaluation dataset.
+11. tests/units/agents/test_auto_assignment_engine.py
+    Added current-run accounting and expanded output-budget regressions.
+12. tests/units/agents/test_mapping_tools.py
+    Added incremental merge and SQL projection preservation regressions.
+13. tests/units/mapping/test_attribute_exclusion.py
+    Added a wide-entity regression proving every pending attribute remains visible.
+14. tests/units/mapping/test_auto_assign_observability.py
+    Added attribute-level completion reporting and non-destructive session merge regressions.
+
+Modified files:
+- .planning/agents/agent_auto_assignment/PLAN.md
+- .planning/agents/agent_auto_assignment/SPEC.md
+- .planning/agents/agent_auto_assignment/eval/dataset.jsonl
+- src/agents/agent_auto_assignment/engine.py
+- src/agents/tools/context.py
+- src/agents/tools/mapping.py
+- src/agents/tools/ontology.py
+- src/back/objects/mapping/Mapping.py
+- src/front/static/mapping/js/mapping-autoassign.js
+- tests/eval/datasets/agent_auto_assignment/regression.jsonl
+- tests/units/agents/test_auto_assignment_engine.py
+- tests/units/agents/test_mapping_tools.py
+- tests/units/mapping/test_attribute_exclusion.py
+- tests/units/mapping/test_auto_assign_observability.py
+
+Tests: `uv run --frozen pytest -q -m "not scenario"` completed with 0 failures (6 scenario tests deselected); focused mapping/PGE compatibility suite: 149 passed; `node --check src/front/static/mapping/js/mapping-autoassign.js` passed.

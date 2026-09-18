@@ -30,7 +30,12 @@ one serial agentic loop over chunks of items, driven by
 
 | Tool name | Input schema | Output type | Purpose |
 |---|---|---|---|
-| _TBD_ | _TBD_ | _TBD_ | See `src/agents/agent_auto_assignment/tools.py` (`TOOL_DEFINITIONS`) |
+| `get_ontology` | `{}` | JSON ontology scope plus existing mapping context | Return every pending, non-excluded attribute and relationship in the current chunk. |
+| `get_metadata` | `{}` | JSON table schemas | Return source tables and columns available to mapping SQL. |
+| `get_documents_context` | `{}` | JSON document excerpts | Supply additional domain semantics. |
+| `execute_sql` | `{sql}` | JSON columns and sample rows | Validate candidate row-returning SQL. |
+| `submit_entity_mapping` | class URI/name, SQL, ID/label columns, attribute maps, optional unmapped attributes | JSON result | Record a projection-safe entity mapping while preserving existing assignments. |
+| `submit_relationship_mapping` | property URI/name, SQL, source/target columns, domain/range/direction | JSON result | Record a validated relationship mapping. |
 
 The v0.8.0 live-trace change adds **no tool**. It only makes the existing loop observable.
 
@@ -74,7 +79,11 @@ surfaces. Audit writes are best-effort — a failed audit append must never fail
 
 ## 4. Success criteria
 
-_TBD._
+1. Every requested ontology entity and relationship is either submitted or reported unresolved.
+2. Every pending, non-excluded entity attribute is visible to the agent, including attributes after position 30.
+3. Reassignment preserves prior attribute mappings and exclusions while adding new assignments.
+4. A merged attribute map is persisted only when the final SQL projection exposes every mapped output alias.
+5. Task and audit statistics report requested, mapped, and remaining attributes without counting pre-existing mappings as new work.
 
 ## 5. Eval dimensions
 
@@ -87,6 +96,9 @@ _TBD._
 | `cost_per_call` | USD | `<= 0.01` | `0.10` | MLflow usage |
 | `trace_step_order` | streamed step sequence matches the golden order, append-only | `1.00` | n/a | rule-based |
 | `audit_report_parity` | `meta.steps` equals the last published `task.result["agent_steps"]` | `1.00` | n/a | rule-based |
+| `pending_attribute_visibility` | pending attributes returned / pending attributes requested | `1.00` | n/a | rule-based |
+| `incremental_mapping_safety` | retained mapped aliases present in final SQL projection | `1.00` | n/a | rule-based |
+| `attribute_coverage_reporting` | reported requested/mapped/remaining counts equal ground truth | `1.00` | n/a | rule-based |
 
 **Aggregate threshold:** ≥ `0.90`.
 
@@ -104,7 +116,9 @@ on the mapping-quality dimensions above.
 | Audit trail shows mapping chips but no agent report | `audit_report_parity` = 0 (no `agent_auto_map_run` row) | append the event on all three terminal paths, not just success |
 | Cancel leaves the agent running and the report missing | cancel case in `observability.jsonl` ends without a `cancelled` report | `is_cancelled` check at the top of each chunk |
 | Astra rejects mapping tools on Chat Completions | HTTP 400 mentions function tools with `reasoning_effort`; the mapping task fails before inference | Route Astra tool calls and their remaining conversation history through `/serving-endpoints/responses`, preserve reasoning output items across iterations, and adapt the result to the agent's existing Chat Completions contract |
-| _TBD_ | _TBD_ | _TBD_ |
+| Wide entities remain at low attribute coverage after a successful retry | `pending_attribute_visibility` is below 1.00 or an ontology response contains a truncation note | Remove the positional cap and return only pending, non-excluded attributes. |
+| Reassignment reduces or corrupts prior coverage | `incremental_mapping_safety` fails or the saved mapping loses existing keys | Merge mappings and reject submissions whose SQL drops retained output aliases. |
+| A no-op retry reports all entities mapped | `attribute_coverage_reporting` differs from the requested attribute set | Track current-run submissions and report attribute-level coverage. |
 
 ## 7. Eval dataset
 

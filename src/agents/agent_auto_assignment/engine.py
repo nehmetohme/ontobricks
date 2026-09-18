@@ -35,6 +35,7 @@ logger = get_logger(__name__)
 
 MAX_ITERATIONS = 60
 LLM_TIMEOUT = 180
+MAX_OUTPUT_TOKENS = 8192
 _ITERATION_DELAY_SEC = 3
 
 _TRACE_NAME = "auto_assignment"
@@ -80,7 +81,8 @@ WORKFLOW
 1. Call get_ontology AND get_metadata to understand what needs mapping and what data is available.
 2. Call get_documents_context to read any imported documents — use them to enrich domain knowledge for better mapping decisions.
 3. For EACH entity:
-   a. Compose a SELECT query using the table schemas.
+   a. Compose a SELECT query using the table schemas. If get_ontology includes an \
+existing_mapping, extend that SQL and retain every existing output column.
    b. Call execute_sql to validate the query works and see the columns.
    c. If the query fails, fix the SQL and try execute_sql again.
    d. Once validated, call submit_entity_mapping with the correct column assignments.
@@ -96,6 +98,9 @@ SQL RULES FOR ENTITIES (CRITICAL)
 • The SECOND column MUST be aliased AS Label (human-readable name).
 • If the entity has attributes (non-empty "attributes" list), add one column per \
 attribute after ID and Label.
+• The "attributes" list contains attributes still pending in this run. If an \
+existing_mapping is present, preserve its SQL projections and attribute_mappings, \
+then add the pending attributes to the same query.
 • If the entity has NO attributes, select ONLY ID and Label — no extra columns.
 • If the same column serves as both an alias and an attribute, include it twice: \
 once with the alias (AS ID) and once with its original name.
@@ -197,6 +202,24 @@ def run_agent(
     entities = ontology.get("entities", [])
     relationships = ontology.get("relationships", [])
     total_items = len(entities) + len(relationships)
+    initial_entity_mapping_by_uri = {
+        mapping.get("ontology_class") or mapping.get("class_uri", ""): mapping
+        for mapping in (entity_mappings or [])
+    }
+    requested_attributes_by_uri: Dict[str, set[str]] = {}
+    for entity in entities:
+        uri = entity.get("uri", "")
+        existing = initial_entity_mapping_by_uri.get(uri, {})
+        already_mapped = set((existing.get("attribute_mappings") or {}).keys())
+        excluded = set(existing.get("excluded_attributes") or [])
+        requested_attributes_by_uri[uri] = {
+            attribute
+            for attribute in (entity.get("attributes", []) or [])
+            if attribute not in already_mapped and attribute not in excluded
+        }
+    total_requested_attributes = sum(
+        len(attributes) for attributes in requested_attributes_by_uri.values()
+    )
 
     logger.info(
         "===== AUTO-ASSIGN AGENT START ===== endpoint=%s, entities=%d, relationships=%d, max_iter=%d",
@@ -222,6 +245,51 @@ def run_agent(
 
     result = AgentResult(success=False)
 
+    def submitted_entity_mappings() -> list:
+        return [
+            mapping
+            for mapping in ctx.entity_mappings
+            if (mapping.get("ontology_class") or mapping.get("class_uri", ""))
+            in ctx.submitted_entity_uris
+        ]
+
+    def submitted_relationship_mappings() -> list:
+        return [
+            mapping
+            for mapping in ctx.relationships
+            if mapping.get("property", "") in ctx.submitted_relationship_uris
+        ]
+
+    def attribute_stats() -> tuple[int, int, int]:
+        current_by_uri = {
+            mapping.get("ontology_class") or mapping.get("class_uri", ""): mapping
+            for mapping in ctx.entity_mappings
+        }
+        mapped_count = 0
+        for uri, requested in requested_attributes_by_uri.items():
+            mapped = set(
+                (current_by_uri.get(uri, {}).get("attribute_mappings") or {}).keys()
+            )
+            mapped_count += len(requested & mapped)
+        return (
+            total_requested_attributes,
+            mapped_count,
+            max(total_requested_attributes - mapped_count, 0),
+        )
+
+    def current_stats() -> Dict[str, int]:
+        attributes_requested, attributes_mapped, attributes_remaining = (
+            attribute_stats()
+        )
+        return {
+            "total": total_items,
+            "entities": len(ctx.submitted_entity_uris),
+            "relationships": len(ctx.submitted_relationship_uris),
+            "attributes_requested": attributes_requested,
+            "attributes_mapped": attributes_mapped,
+            "attributes_remaining": attributes_remaining,
+        }
+
     # Build conversation
     user_prompt = _build_user_prompt(entities, relationships)
     messages: List[dict] = [
@@ -238,7 +306,7 @@ def run_agent(
     current_iteration = 0
 
     def _progress_pct() -> int:
-        mapped = len(ctx.entity_mappings) + len(ctx.relationships)
+        mapped = len(ctx.submitted_entity_uris) + len(ctx.submitted_relationship_uris)
         if total_items <= 0:
             return 5
         return min(5 + int((mapped / total_items) * 90), 95)
@@ -272,10 +340,10 @@ def run_agent(
             current_iteration,
             iteration_limit,
             len(messages),
-            len(ctx.entity_mappings),
-            len(ctx.relationships),
+            len(ctx.submitted_entity_uris),
+            len(ctx.submitted_relationship_uris),
         )
-        mapped = len(ctx.entity_mappings) + len(ctx.relationships)
+        mapped = len(ctx.submitted_entity_uris) + len(ctx.submitted_relationship_uris)
         notify(f"Mapped {mapped}/{total_items} — thinking…")
 
         is_last = iteration >= iteration_limit - 1
@@ -289,7 +357,7 @@ def run_agent(
                 endpoint_name,
                 messages,
                 tools=send_tools,
-                max_tokens=2048,
+                max_tokens=MAX_OUTPUT_TOKENS,
                 temperature=0.1,
                 timeout=LLM_TIMEOUT,
                 trace_name=_TRACE_NAME,
@@ -434,7 +502,7 @@ def run_agent(
                     }
                 )
 
-            mapped = len(ctx.entity_mappings) + len(ctx.relationships)
+            mapped = len(ctx.submitted_entity_uris) + len(ctx.submitted_relationship_uris)
             notify(f"Mapped {mapped}/{total_items} items")
             logger.info(
                 "Iteration %d: tool calls done, conversation=%d messages, mappings=%d/%d",
@@ -460,24 +528,26 @@ def run_agent(
                 )
             )
 
-            result.success = True
-            result.entity_mappings = ctx.entity_mappings
-            result.relationship_mappings = ctx.relationships
+            result.entity_mappings = submitted_entity_mappings()
+            result.relationship_mappings = submitted_relationship_mappings()
             result.iterations = iteration + 1
             result.usage = total_usage
-            result.stats = {
-                "total": total_items,
-                "entities": len(ctx.entity_mappings),
-                "relationships": len(ctx.relationships),
-            }
+            result.stats = current_stats()
+
+            if not result.entity_mappings and not result.relationship_mappings:
+                result.error = "Agent finished without submitting mappings"
+                logger.error("===== AUTO-ASSIGN AGENT FAILED ===== %s", result.error)
+                return result
+
+            result.success = True
 
             logger.info(
                 "===== AUTO-ASSIGN AGENT COMPLETE ===== iterations=%d, "
                 "entity_mappings=%d, rel_mappings=%d, "
                 "prompt_tokens=%d, completion_tokens=%d",
                 result.iterations,
-                len(ctx.entity_mappings),
-                len(ctx.relationships),
+                len(result.entity_mappings),
+                len(result.relationship_mappings),
                 total_usage["prompt_tokens"],
                 total_usage["completion_tokens"],
             )
@@ -485,23 +555,19 @@ def run_agent(
             return result
 
     # Exhausted iterations — still return what we have
-    result.entity_mappings = ctx.entity_mappings
-    result.relationship_mappings = ctx.relationships
+    result.entity_mappings = submitted_entity_mappings()
+    result.relationship_mappings = submitted_relationship_mappings()
     result.iterations = iteration_limit
     result.usage = total_usage
-    result.stats = {
-        "total": total_items,
-        "entities": len(ctx.entity_mappings),
-        "relationships": len(ctx.relationships),
-    }
-    if ctx.entity_mappings or ctx.relationships:
+    result.stats = current_stats()
+    if result.entity_mappings or result.relationship_mappings:
         result.success = True
         result.error = f"Agent used all {iteration_limit} iterations but submitted partial mappings"
         logger.warning(
             "===== AUTO-ASSIGN AGENT PARTIAL ===== %s — entity=%d, rel=%d",
             result.error,
-            len(ctx.entity_mappings),
-            len(ctx.relationships),
+            len(result.entity_mappings),
+            len(result.relationship_mappings),
         )
     else:
         result.error = f"Agent reached maximum iterations ({iteration_limit}) without producing mappings"

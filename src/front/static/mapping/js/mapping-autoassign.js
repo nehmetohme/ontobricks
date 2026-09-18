@@ -651,19 +651,24 @@ window.AutoAssignModule = {
             return;
         }
         
-        // Build data for backend (same format as start()) — exclude user-excluded attributes
+        // Build data for backend with only attributes still needing assignment.
         const entities = partialEntities.map(entity => {
-            const existingMapping = entityMappings.find(m => m.ontology_class === entity.uri);
+            const existingMapping = mappingByClass[entity.uri];
             const exclAttrs = new Set(existingMapping?.excluded_attributes || []);
+            const mappedAttrs = new Set(Object.keys(existingMapping?.attribute_mappings || {}));
             const attributes = (entity.dataProperties || [])
                 .map(a => a.name || a.localName || a)
-                .filter(a => !exclAttrs.has(a));
+                .filter(a => !exclAttrs.has(a) && !mappedAttrs.has(a));
             return {
                 uri: entity.uri,
                 name: entity.label || entity.name || entity.localName,
                 attributes: attributes
             };
         });
+        const missingAttributeCount = entities.reduce(
+            (total, entity) => total + entity.attributes.length,
+            0
+        );
         
         // Build schema context
         const schemaContext = typeof buildSchemaContext === 'function' ? buildSchemaContext() : {};
@@ -698,7 +703,10 @@ window.AutoAssignModule = {
             
             if (typeof refreshTasks === 'function') refreshTasks();
             
-            showNotification(`Re-assigning ${partialEntities.length} entities with missing attributes...`, 'info');
+            showNotification(
+                `Re-assigning ${missingAttributeCount} missing attributes across ${partialEntities.length} entities...`,
+                'info'
+            );
             
             this.monitorTask(result.task_id);
             

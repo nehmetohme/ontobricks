@@ -82,7 +82,15 @@ def _agent_result(uris, steps):
     )
 
 
-def _run(agent_side_effect, *, entities, tm, task, recorded):
+def _run(
+    agent_side_effect,
+    *,
+    entities,
+    tm,
+    task,
+    recorded,
+    existing_entity_mappings=None,
+):
     """Drive ``run_auto_assign_task`` with one entity per chunk."""
     mapping = Mapping(MagicMock())
 
@@ -113,7 +121,7 @@ def _run(agent_side_effect, *, entities, tm, task, recorded):
             schema_context={},
             session_id=SESSION_ID,
             session_ref={},
-            entity_mappings=[],
+            entity_mappings=list(existing_entity_mappings or []),
             relationship_mappings=[],
         )
 
@@ -338,6 +346,83 @@ class TestAuditReport:
 
         assert [r["status"] for r in recorded] == ["failed"]
         assert "boom" in recorded[0]["summary"]
+
+
+@pytest.mark.unit
+class TestAttributeCoverageReporting:
+    def test_completion_reports_requested_mapped_and_remaining_attributes(self):
+        uri = "http://x/Customer"
+        task = _FakeTask()
+        tm = _FakeTaskManager()
+        existing = [
+            {
+                "ontology_class": uri,
+                "attribute_mappings": {"firstName": "first_name"},
+                "sql_query": "SELECT id AS ID, name AS Label, first_name FROM source",
+            }
+        ]
+
+        def agent(**_kwargs):
+            return SimpleNamespace(
+                success=True,
+                error=None,
+                entity_mappings=[
+                    {
+                        "ontology_class": uri,
+                        "attribute_mappings": {"firstName": "first_name"},
+                        "sql_query": existing[0]["sql_query"],
+                    }
+                ],
+                relationship_mappings=[],
+                steps=[],
+                iterations=1,
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
+                stats={"entities": 1, "relationships": 0},
+            )
+
+        _run(
+            agent,
+            entities=[
+                {
+                    "uri": uri,
+                    "name": "Customer",
+                    "attributes": ["firstName", "lastName"],
+                }
+            ],
+            tm=tm,
+            task=task,
+            recorded=[],
+            existing_entity_mappings=existing,
+        )
+
+        stats = tm.completed["result"]["stats"]
+        assert stats["attributes_requested"] == 1
+        assert stats["attributes_mapped"] == 0
+        assert stats["attributes_remaining"] == 1
+        assert "attributes 0/1 mapped" in tm.completed["message"]
+
+    def test_entity_merge_preserves_existing_attribute_assignments(self):
+        existing = [
+            {
+                "ontology_class": "http://x/Customer",
+                "attribute_mappings": {"firstName": "first_name"},
+                "excluded_attributes": ["internalNote"],
+            }
+        ]
+        incoming = [
+            {
+                "ontology_class": "http://x/Customer",
+                "attribute_mappings": {"lastName": "last_name"},
+            }
+        ]
+
+        merged = Mapping._merge_entity_mappings(existing, incoming)
+
+        assert merged[0]["attribute_mappings"] == {
+            "firstName": "first_name",
+            "lastName": "last_name",
+        }
+        assert merged[0]["excluded_attributes"] == ["internalNote"]
 
 
 class TestCooperativeCancellation:

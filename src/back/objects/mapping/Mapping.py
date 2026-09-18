@@ -198,6 +198,52 @@ class Mapping:
             max_iterations=max_iterations,
         )
 
+    @staticmethod
+    def _pending_attributes_by_uri(
+        entities: List[Dict[str, Any]],
+        existing_mappings: List[Dict[str, Any]],
+    ) -> Dict[str, Set[str]]:
+        """Return attributes requested by this run after baseline coverage."""
+        existing_by_uri = {
+            mapping.get("ontology_class") or mapping.get("class_uri", ""): mapping
+            for mapping in existing_mappings
+        }
+        pending: Dict[str, Set[str]] = {}
+        for entity in entities:
+            uri = entity.get("uri", "")
+            existing = existing_by_uri.get(uri, {})
+            mapped = set((existing.get("attribute_mappings") or {}).keys())
+            excluded = set(existing.get("excluded_attributes") or [])
+            pending[uri] = {
+                attribute
+                for attribute in (entity.get("attributes", []) or [])
+                if attribute not in mapped and attribute not in excluded
+            }
+        return pending
+
+    @staticmethod
+    def _attribute_run_stats(
+        pending_by_uri: Dict[str, Set[str]],
+        generated_mappings: List[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        """Count requested attributes covered by mappings generated in this run."""
+        generated_by_uri = {
+            mapping.get("ontology_class") or mapping.get("class_uri", ""): mapping
+            for mapping in generated_mappings
+        }
+        requested = sum(len(attributes) for attributes in pending_by_uri.values())
+        mapped = 0
+        for uri, attributes in pending_by_uri.items():
+            mapped_names = set(
+                (generated_by_uri.get(uri, {}).get("attribute_mappings") or {}).keys()
+            )
+            mapped += len(attributes & mapped_names)
+        return {
+            "attributes_requested": requested,
+            "attributes_mapped": mapped,
+            "attributes_remaining": max(requested - mapped, 0),
+        }
+
     def run_auto_assign_task(
         self,
         task: Any,
@@ -226,6 +272,12 @@ class Mapping:
         domain = self._domain
         tm = get_task_manager()
         total_items = len(entities) + len(relationships)
+        pending_attributes_by_uri = Mapping._pending_attributes_by_uri(
+            entities, entity_mappings
+        )
+        initial_attribute_stats = Mapping._attribute_run_stats(
+            pending_attributes_by_uri, []
+        )
         # Declared outside the try so the failure path can still report
         # whatever the agent managed to execute before it broke.
         all_steps: List[Any] = []
@@ -243,6 +295,7 @@ class Mapping:
                 "entities_total": len(entities),
                 "relationships_assigned": 0,
                 "relationships_total": len(relationships),
+                **initial_attribute_stats,
             }
             logger.info("Auto-assign agent thread started — task=%s", task.id)
 
@@ -400,6 +453,10 @@ class Mapping:
 
                 e_done = len(entity_mapping_by_uri)
                 r_done = len(rel_mapping_by_uri)
+                live_attribute_stats = Mapping._attribute_run_stats(
+                    pending_attributes_by_uri,
+                    list(entity_mapping_by_uri.values()),
+                )
 
                 tm.update_progress(
                     task.id,
@@ -418,6 +475,7 @@ class Mapping:
                     "entities_total": len(entities),
                     "relationships_assigned": r_done,
                     "relationships_total": len(relationships),
+                    **live_attribute_stats,
                     "agent_steps": serialize_agent_steps(all_steps),
                 }
 
@@ -435,6 +493,9 @@ class Mapping:
             all_relationship_mappings = list(rel_mapping_by_uri.values())
             e_count = len(all_entity_mappings)
             r_count = len(all_relationship_mappings)
+            attribute_stats = Mapping._attribute_run_stats(
+                pending_attributes_by_uri, all_entity_mappings
+            )
 
             logger.info(
                 "===== AUTO-ASSIGN AGENT DONE ===== entities=%d, relationships=%d, "
@@ -471,6 +532,7 @@ class Mapping:
                 "relationships": r_count,
                 "failed": max(total_items - e_count - r_count, 0),
                 "chunk_errors": list(chunk_errors),
+                **attribute_stats,
             }
 
             if cancelled:
@@ -556,13 +618,22 @@ class Mapping:
             # tell environmental issues apart from "expected — nothing
             # in the data to map onto".
             unmapped_items = total_items - e_count - r_count
-            message = f"Completed: {e_count} entities, {r_count} relationships mapped"
+            message = (
+                f"Completed: {e_count} entities, {r_count} relationships mapped"
+            )
+            if attribute_stats["attributes_requested"]:
+                message += (
+                    f", attributes {attribute_stats['attributes_mapped']}/"
+                    f"{attribute_stats['attributes_requested']} mapped"
+                )
             tail_parts = []
             if chunk_errors:
                 tail_parts.append(f"{len(chunk_errors)} chunk(s) errored")
             no_mapping_items = max(unmapped_items - 0, 0)  # explicit; clarity
             if no_mapping_items > 0:
-                tail_parts.append(f"{no_mapping_items} item(s) without a generated mapping")
+                tail_parts.append(
+                    f"{no_mapping_items} item(s) without a generated mapping"
+                )
             if tail_parts:
                 message += " (" + ", ".join(tail_parts) + ")"
 
@@ -576,6 +647,7 @@ class Mapping:
                         "failed": total_items - e_count - r_count,
                         "chunk_errors_count": len(chunk_errors),
                         "chunk_errors": chunk_errors,  # NEW — exposed for UI/debug
+                        **attribute_stats,
                     },
                     "entity_mappings": all_entity_mappings,
                     "relationship_mappings": all_relationship_mappings,
@@ -1245,9 +1317,23 @@ class Mapping:
                 None,
             )
             if idx is not None:
-                if merged[idx].get("excluded") and "excluded" not in new_m:
-                    new_m["excluded"] = True
-                merged[idx] = new_m
+                existing_mapping = merged[idx]
+                merged_mapping = {**existing_mapping, **new_m}
+                merged_attributes = dict(
+                    existing_mapping.get("attribute_mappings") or {}
+                )
+                merged_attributes.update(new_m.get("attribute_mappings") or {})
+                merged_mapping["attribute_mappings"] = merged_attributes
+                if existing_mapping.get("excluded") and "excluded" not in new_m:
+                    merged_mapping["excluded"] = True
+                if (
+                    existing_mapping.get("excluded_attributes")
+                    and "excluded_attributes" not in new_m
+                ):
+                    merged_mapping["excluded_attributes"] = list(
+                        existing_mapping["excluded_attributes"]
+                    )
+                merged[idx] = merged_mapping
             else:
                 merged.append(new_m)
         return merged
